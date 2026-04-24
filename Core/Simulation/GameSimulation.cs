@@ -13,7 +13,7 @@ using WorldTileMap = RtsNaGodote.Core.Simulation.World.TileMap;
 
 namespace RtsNaGodote.Core.Simulation;
 
-public sealed class GameSimulation
+public sealed partial class GameSimulation
 {
     private const float CombatBuildingTargetPenalty = 72f;
     private const float CombatRetargetBuffer = 18f;
@@ -42,7 +42,6 @@ public sealed class GameSimulation
     private const int ScoutMinPeekVisibleTiles = 2;
     private const int FrontierScoutPreferredPeekDepthTiles = 2;
     private const int FrontierScoutMaxPeekDepthTiles = 3;
-
     private readonly record struct CombatApproachSlot(Vector2 Target, float ArrivalRadius);
 
     public event Action<Vector2, Vector2, GameSide, bool, bool>? ProjectileLaunched;
@@ -61,11 +60,9 @@ public sealed class GameSimulation
     private readonly DifficultyDefinition _difficultyDefinition;
     private readonly AiMemory _aiMemory = new();
     private readonly HarassMissionState _aiHarassMission = new();
-    private readonly ScoutMissionState _aiScoutMission = new();
     private PlayerVisionSnapshot? _playerVisionSnapshot;
     private AiState _aiState = AiState.Open;
     private double _aiStateEnteredMs;
-    private int? _aiWorkerScoutId;
     private double _aiLastScoutCommandMs = -99999d;
     private double _aiLastHarassCommandMs = -99999d;
     private double _aiLastMainCommandMs = -99999d;
@@ -85,6 +82,7 @@ public sealed class GameSimulation
         Resources = [];
         Economy = new EconomySystem();
         _aiStateEnteredMs = 0d;
+        _scoutSystem = new ScoutSystem(CreateScoutContext());
 
         SpawnInitialState();
     }
@@ -274,7 +272,7 @@ public sealed class GameSimulation
         unit.TargetBuilding = site;
         unit.SaveWorkerBuildOrder(site);
         var reach = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        Repath(unit, site.Center, reach);
+        Repath(unit, site.Center, reach, interactionAnchor: site.Center);
         unit.SetState(UnitState.Build);
     }
 
@@ -292,7 +290,7 @@ public sealed class GameSimulation
         unit.ReturnBuilding = hall;
         unit.Path.Clear();
         var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach);
+        Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
         unit.SetState(UnitState.ReturnCargo);
     }
 
@@ -607,11 +605,11 @@ public sealed class GameSimulation
             {
                 if (TryBuildCombatApproachTarget(unit, target, out var approachTarget, out var approachArrivalRadius))
                 {
-                    Repath(unit, approachTarget, approachArrivalRadius);
+                    Repath(unit, approachTarget, approachArrivalRadius, interactionAnchor: target.Position);
                 }
                 else
                 {
-                    Repath(unit, target.Position, range);
+                    Repath(unit, target.Position, range, interactionAnchor: target.Position);
                 }
             }
 
@@ -683,7 +681,7 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, GetWorkerGatherPathTarget(unit, node), reach);
+                Repath(unit, GetWorkerGatherPathTarget(unit, node), reach, interactionAnchor: node.Center);
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -738,7 +736,7 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach);
+                Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -796,7 +794,7 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, site.Center, reach);
+                Repath(unit, site.Center, reach, interactionAnchor: site.Center);
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -1106,7 +1104,7 @@ public sealed class GameSimulation
         unit.ReturnBuilding = hall;
         unit.Path.Clear();
         var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach);
+        Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
         unit.SetState(UnitState.ReturnCargo);
     }
 
@@ -1173,7 +1171,7 @@ public sealed class GameSimulation
         worker.WorkerCombatLeashRadius = hall.Radius * GameConstants.WorkerCombatLeashHallRadiusMultiplier;
         worker.ReturnBuilding = hall;
         var reach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach);
+        Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach, interactionAnchor: hall.Center);
         worker.SetState(worker.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
     }
 
@@ -1208,7 +1206,7 @@ public sealed class GameSimulation
         {
             if (worker.Path.Count == 0 || worker.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach);
+                Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach, interactionAnchor: hall.Center);
             }
 
             AdvanceWithRecovery(worker, delta);
@@ -1338,7 +1336,7 @@ public sealed class GameSimulation
                     worker.ClearOrders(false);
                     worker.TargetBuilding = site;
                     var buildReach = site.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-                    Repath(worker, site.Center, buildReach);
+                    Repath(worker, site.Center, buildReach, interactionAnchor: site.Center);
                     worker.SetState(UnitState.Build);
                     return;
                 }
@@ -1354,7 +1352,7 @@ public sealed class GameSimulation
                         worker.ClearOrders(false);
                         worker.ReturnBuilding = hall;
                         var returnReach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-                        Repath(worker, GetWorkerReturnPathTarget(worker, hall), returnReach);
+                        Repath(worker, GetWorkerReturnPathTarget(worker, hall), returnReach, interactionAnchor: hall.Center);
                         worker.SetState(UnitState.ReturnCargo);
                         return;
                     }
@@ -1386,12 +1384,19 @@ public sealed class GameSimulation
         worker.ClearOrders();
     }
 
-    private bool Repath(SimUnit unit, Vector2 worldTarget, float arrivalRadius, bool stuckReroute = false, bool preserveExistingPathOnFailure = false)
+    private bool Repath(
+        SimUnit unit,
+        Vector2 worldTarget,
+        float arrivalRadius,
+        bool stuckReroute = false,
+        bool preserveExistingPathOnFailure = false,
+        Vector2? interactionAnchor = null)
     {
         var start = Map.WorldToTile(unit.Position);
         var goal = Map.WorldToTile(worldTarget);
         var goalRadiusTiles = int.Max(0, Mathf.CeilToInt(arrivalRadius / GameConstants.TileSize));
-        var allowStartAsGoal = arrivalRadius <= 0f || unit.Position.DistanceTo(worldTarget) <= arrivalRadius + 0.5f;
+        var anchor = interactionAnchor ?? worldTarget;
+        var allowStartAsGoal = arrivalRadius <= 0f || unit.Position.DistanceTo(anchor) <= arrivalRadius + 0.5f;
         var previousPath = preserveExistingPathOnFailure ? new List<Vector2>(unit.Path) : null;
         var previousDestination = unit.PathDestination;
         var tilePenalty = BuildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
@@ -1406,7 +1411,7 @@ public sealed class GameSimulation
         if (tilePath.Count == 0)
         {
             if (!allowStartAsGoal &&
-                TryBuildCloseRangeFallbackPath(unit, worldTarget, arrivalRadius, out var fallbackPath))
+                TryBuildCloseRangeFallbackPath(unit, worldTarget, anchor, arrivalRadius, out var fallbackPath))
             {
                 unit.SetPath(fallbackPath);
                 unit.PathDestination = worldTarget;
@@ -1444,7 +1449,12 @@ public sealed class GameSimulation
         return true;
     }
 
-    private bool TryBuildCloseRangeFallbackPath(SimUnit unit, Vector2 worldTarget, float arrivalRadius, out List<Vector2> path)
+    private bool TryBuildCloseRangeFallbackPath(
+        SimUnit unit,
+        Vector2 worldTarget,
+        Vector2 interactionAnchor,
+        float arrivalRadius,
+        out List<Vector2> path)
     {
         path = [];
         if (arrivalRadius <= 0f)
@@ -1452,20 +1462,24 @@ public sealed class GameSimulation
             return false;
         }
 
-        var distance = unit.Position.DistanceTo(worldTarget);
+        var distance = unit.Position.DistanceTo(interactionAnchor);
         if (distance > arrivalRadius + GameConstants.TileSize * 1.4f)
         {
             return false;
         }
 
-        var direction = unit.Position - worldTarget;
+        var direction = unit.Position - interactionAnchor;
         if (direction.LengthSquared() <= 0.01f)
         {
-            direction = Vector2.Right;
+            direction = unit.Position - worldTarget;
+            if (direction.LengthSquared() <= 0.01f)
+            {
+                direction = Vector2.Right;
+            }
         }
 
         var stopDistance = Mathf.Max(arrivalRadius * 0.9f, unit.Radius + 2f);
-        var candidate = worldTarget + direction.Normalized() * stopDistance;
+        var candidate = interactionAnchor + direction.Normalized() * stopDistance;
         if (!TryMoveToCandidate(unit, candidate, 1.5f))
         {
             return false;
@@ -1911,31 +1925,33 @@ public sealed class GameSimulation
             return;
         }
 
-        if (TryGetRepathTarget(unit, out var repathTarget, out var arrivalRadius))
+        if (TryGetRepathTarget(unit, out var repathTarget, out var arrivalRadius, out var interactionAnchor))
         {
-            if (Repath(unit, repathTarget, arrivalRadius, preserveExistingPathOnFailure: true))
+            if (Repath(unit, repathTarget, arrivalRadius, preserveExistingPathOnFailure: true, interactionAnchor: interactionAnchor))
             {
                 return;
             }
 
             if (allowHeavyReroute && _elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
             {
-                Repath(unit, repathTarget, arrivalRadius, stuckReroute: true, preserveExistingPathOnFailure: true);
+                Repath(unit, repathTarget, arrivalRadius, stuckReroute: true, preserveExistingPathOnFailure: true, interactionAnchor: interactionAnchor);
             }
         }
     }
 
-    private bool TryGetRepathTarget(SimUnit unit, out Vector2 target, out float arrivalRadius)
+    private bool TryGetRepathTarget(SimUnit unit, out Vector2 target, out float arrivalRadius, out Vector2 interactionAnchor)
     {
         if (unit.TargetCombat is { Alive: true } combat)
         {
             if (TryBuildCombatApproachTarget(unit, combat, out target, out arrivalRadius))
             {
+                interactionAnchor = combat.Position;
                 return true;
             }
 
             target = combat.Position;
             arrivalRadius = GetAttackRange(unit, combat);
+            interactionAnchor = combat.Position;
             return true;
         }
 
@@ -1943,6 +1959,7 @@ public sealed class GameSimulation
         {
             target = GetWorkerGatherPathTarget(unit, resource);
             arrivalRadius = resource.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
+            interactionAnchor = resource.Center;
             return true;
         }
 
@@ -1950,6 +1967,7 @@ public sealed class GameSimulation
         {
             target = GetWorkerReturnPathTarget(unit, hall);
             arrivalRadius = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
+            interactionAnchor = hall.Center;
             return true;
         }
 
@@ -1957,6 +1975,7 @@ public sealed class GameSimulation
         {
             target = site.Center;
             arrivalRadius = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
+            interactionAnchor = site.Center;
             return true;
         }
 
@@ -1964,11 +1983,13 @@ public sealed class GameSimulation
         {
             target = unit.PathDestination.Value;
             arrivalRadius = 0f;
+            interactionAnchor = target;
             return true;
         }
 
         target = Vector2.Zero;
         arrivalRadius = 0f;
+        interactionAnchor = Vector2.Zero;
         return false;
     }
 
@@ -2030,12 +2051,12 @@ public sealed class GameSimulation
 
         if (approachingHall)
         {
-            var depth = Mathf.Max(GameConstants.TileSize * 0.35f, hallRadius * 0.62f) + Mathf.Abs(laneIndex) * 1.5f;
+            var depth = hallRadius + GameConstants.TileSize * 0.35f + Mathf.Abs(laneIndex) * 1.5f;
             target = hallCenter + routeDirection * depth - laneOffset;
             return true;
         }
 
-        var depthToNode = Mathf.Max(GameConstants.TileSize * 0.35f, nodeRadius * 0.58f) + Mathf.Abs(laneIndex) * 1.2f;
+        var depthToNode = nodeRadius + GameConstants.TileSize * 0.28f + Mathf.Abs(laneIndex) * 1.2f;
         target = nodeCenter - routeDirection * depthToNode + laneOffset;
         return true;
     }
@@ -2433,12 +2454,12 @@ public sealed class GameSimulation
 
         if (_aiState != AiState.Scout || confirmedBase.HasValue)
         {
-            _aiWorkerScoutId = null;
+            _scoutSystem.ClearWorkerScoutReservation();
         }
 
         if (_aiState != AiState.Scout)
         {
-            ResetScoutMission();
+            _scoutSystem.ResetMission();
         }
 
         if (_aiState == AiState.Harass)
@@ -2760,53 +2781,6 @@ public sealed class GameSimulation
         return armyMetrics.Count >= 3 ? AiState.Regroup : AiState.Boom;
     }
 
-    private bool ShouldContinueScoutMission(bool baseConfirmed)
-    {
-        if (!_aiScoutMission.Active)
-        {
-            return false;
-        }
-
-        if (!baseConfirmed)
-        {
-            return true;
-        }
-
-        if (_elapsedMs - _aiScoutMission.ConfirmedBaseMs <= ScoutContinueAfterConfirmMs)
-        {
-            return true;
-        }
-
-        if (_aiScoutMission.ScoutUnitId is not int scoutId)
-        {
-            return false;
-        }
-
-        var scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == scoutId);
-        if (scout is null)
-        {
-            return false;
-        }
-
-        if (_aiScoutMission.Phase is ScoutMissionPhase.BreakContact or ScoutMissionPhase.Reposition)
-        {
-            return true;
-        }
-
-        if (_elapsedMs - _aiScoutMission.LastThreatMs < _difficultyDefinition.ScoutReentryDelayMs)
-        {
-            return true;
-        }
-
-        var safeDistance = scout.Sight * GameConstants.TileSize;
-        if (scout.Position.DistanceTo(_aiScoutMission.BasePosition) <= safeDistance)
-        {
-            return true;
-        }
-
-        return EstimateScoutSectorThreat(scout.Position) > _difficultyDefinition.ScoutThreatTolerance * 0.45f;
-    }
-
     private bool ShouldUseHarassSplit(
         bool hasBarracks,
         bool baseConfirmed,
@@ -3097,1130 +3071,6 @@ public sealed class GameSimulation
                 _aiLastMainCommandMs = _elapsedMs;
                 break;
         }
-    }
-
-    private void CommandScout(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 stagePoint)
-    {
-        var scout = SelectScoutUnit(mainArmy, workersFallback, suspectedBase, stagePoint);
-        if (scout is null)
-        {
-            ResetScoutMission();
-            foreach (var unit in mainArmy)
-            {
-                CommandUnitMove(unit, stagePoint);
-            }
-
-            return;
-        }
-
-        EnsureScoutMission(scout, suspectedBase, stagePoint);
-        var scoutTarget = UpdateScoutMission(scout, suspectedBase, stagePoint);
-        if (_elapsedMs - _aiLastScoutCommandMs > 420d ||
-            scout.State != UnitState.Move ||
-            !scout.PathDestination.HasValue ||
-            scout.PathDestination.Value.DistanceTo(scoutTarget) > 18f)
-        {
-            CommandUnitMove(scout, scoutTarget);
-            _aiLastScoutCommandMs = _elapsedMs;
-        }
-
-        foreach (var unit in mainArmy)
-        {
-            if (unit != scout)
-            {
-                CommandUnitMove(unit, stagePoint);
-            }
-        }
-    }
-
-    private SimUnit? SelectScoutUnit(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 fallback)
-    {
-        SimUnit? scout = null;
-        if (_aiScoutMission.ScoutUnitId.HasValue)
-        {
-            scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiScoutMission.ScoutUnitId.Value);
-            if (scout is not null)
-            {
-                return scout;
-            }
-
-            ResetScoutMission();
-        }
-
-        var bestScore = float.NegativeInfinity;
-        foreach (var unit in mainArmy)
-        {
-            var score = EvaluateScoutCandidate(unit);
-            if (score > bestScore)
-            {
-                bestScore = score;
-                scout = unit;
-            }
-        }
-
-        if (scout is not null)
-        {
-            _aiWorkerScoutId = null;
-            return scout;
-        }
-
-        if (!workersFallback)
-        {
-            return null;
-        }
-
-        if (_aiWorkerScoutId.HasValue)
-        {
-            scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiWorkerScoutId.Value);
-            if (scout is not null &&
-                scout.IsWorker() &&
-                scout.State is UnitState.Idle or UnitState.Gather &&
-                CanWorkerScoutSafely(scout, suspectedBase, fallback))
-            {
-                return scout;
-            }
-
-            _aiWorkerScoutId = null;
-        }
-
-        foreach (var worker in Units)
-        {
-            if (!worker.Alive || worker.Side != GameSide.AI || !worker.IsWorker())
-            {
-                continue;
-            }
-
-            if (worker.State is not (UnitState.Idle or UnitState.Gather) ||
-                !CanWorkerScoutSafely(worker, suspectedBase, fallback))
-            {
-                continue;
-            }
-
-            _aiWorkerScoutId = worker.Id;
-            return worker;
-        }
-
-        return null;
-    }
-
-    private float EvaluateScoutCandidate(SimUnit unit)
-    {
-        if (!unit.Alive || unit.Kind == UnitKind.Catapult)
-        {
-            return float.NegativeInfinity;
-        }
-
-        var durability = unit.MaxHp <= 0 ? 0f : unit.Hp / (float)unit.MaxHp;
-        var kindBonus = unit.Kind switch
-        {
-            UnitKind.Knight => 90f,
-            UnitKind.Archer => 56f,
-            UnitKind.Footman => 34f,
-            UnitKind.Worker => -140f,
-            _ => 0f
-        };
-        var rangedSafety = unit.IsRanged() ? 12f : 0f;
-        var combatPenalty = unit.State == UnitState.Attack ? 10f : 0f;
-        return unit.Speed * 2.4f +
-               unit.Sight * 20f +
-               unit.Hp * 0.08f +
-               durability * 55f +
-               rangedSafety +
-               kindBonus -
-               combatPenalty;
-    }
-
-    private bool CanWorkerScoutSafely(SimUnit worker, Vector2 suspectedBase, Vector2 fallback)
-    {
-        if (!worker.Alive || !worker.IsWorker())
-        {
-            return false;
-        }
-
-        var basePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
-        var baseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(basePosition);
-        var savedCurrentSector = _aiScoutMission.CurrentSector;
-        var savedLastSector = _aiScoutMission.LastSector;
-        var savedEntry = _aiScoutMission.EntryPoint;
-        var savedPeek = _aiScoutMission.PeekPoint;
-        var savedExit = _aiScoutMission.PlannedExitPoint;
-        var savedFallbackExit = _aiScoutMission.FallbackExitPoint;
-        var savedExposure = _aiScoutMission.ExposureStartedMs;
-        var savedIntelKind = _aiScoutMission.LastIntelTargetKind;
-        var savedRouteExposure = _aiScoutMission.CurrentRouteExposure;
-        var savedVisibleRun = _aiScoutMission.CurrentVisibleRunLength;
-        var savedPeekCompleted = _aiScoutMission.PeekCompleted;
-        var savedRequireSectorSwitch = _aiScoutMission.RequireSectorSwitch;
-        var canScout = TryPlanScoutSector(worker, basePosition, baseTile, fallback, allowRepeat: true, out _);
-        _aiScoutMission.CurrentSector = savedCurrentSector;
-        _aiScoutMission.LastSector = savedLastSector;
-        _aiScoutMission.EntryPoint = savedEntry;
-        _aiScoutMission.PeekPoint = savedPeek;
-        _aiScoutMission.PlannedExitPoint = savedExit;
-        _aiScoutMission.FallbackExitPoint = savedFallbackExit;
-        _aiScoutMission.ExposureStartedMs = savedExposure;
-        _aiScoutMission.LastIntelTargetKind = savedIntelKind;
-        _aiScoutMission.CurrentRouteExposure = savedRouteExposure;
-        _aiScoutMission.CurrentVisibleRunLength = savedVisibleRun;
-        _aiScoutMission.PeekCompleted = savedPeekCompleted;
-        _aiScoutMission.RequireSectorSwitch = savedRequireSectorSwitch;
-        return canScout;
-    }
-
-    private void EnsureScoutMission(SimUnit scout, Vector2 suspectedBase, Vector2 fallback)
-    {
-        if (_aiScoutMission.Active && _aiScoutMission.ScoutUnitId == scout.Id)
-        {
-            scout.IsNonCombatScout = true;
-            scout.TargetCombat = null;
-            return;
-        }
-
-        ReleaseScoutLock();
-        _aiScoutMission.Reset();
-        _aiScoutMission.Active = true;
-        _aiScoutMission.ScoutUnitId = scout.Id;
-        _aiScoutMission.WorkerFallback = scout.IsWorker();
-        _aiScoutMission.BaseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(suspectedBase);
-        _aiScoutMission.BasePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
-        _aiScoutMission.RecoverPoint = fallback;
-        _aiScoutMission.Phase = ScoutMissionPhase.ApproachEdge;
-        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-        _aiScoutMission.LastThreatMs = -99999d;
-        _aiScoutMission.ConfirmedBaseMs = _aiMemory.LastKnownPlayerBase.HasValue ? _elapsedMs : -99999d;
-        _aiScoutMission.ExposureStartedMs = -99999d;
-        _aiScoutMission.CurrentSector = -1;
-        _aiScoutMission.LastSector = -1;
-        scout.IsNonCombatScout = true;
-        scout.TargetCombat = null;
-        TryPlanScoutSector(scout, _aiScoutMission.BasePosition, _aiScoutMission.BaseTile!.Value, fallback, allowRepeat: Init.Difficulty == Difficulty.Easy, out _);
-    }
-
-    private Vector2 UpdateScoutMission(SimUnit scout, Vector2 suspectedBase, Vector2 fallback)
-    {
-        scout.IsNonCombatScout = true;
-        scout.TargetCombat = null;
-
-        var basePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
-        var baseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(basePosition);
-        _aiScoutMission.BasePosition = basePosition;
-        _aiScoutMission.BaseTile = baseTile;
-        _aiScoutMission.RecoverPoint = fallback;
-        if (_aiMemory.LastKnownPlayerBase.HasValue && _aiScoutMission.ConfirmedBaseMs < 0d)
-        {
-            _aiScoutMission.ConfirmedBaseMs = _elapsedMs;
-        }
-
-        var threat = FindScoutThreat(scout);
-        if (threat is not null)
-        {
-            _aiScoutMission.LastThreatMs = _elapsedMs;
-            _aiScoutMission.LastThreatPosition = threat.Position;
-        }
-
-        if (_aiScoutMission.Phase is ScoutMissionPhase.Peek or ScoutMissionPhase.ReEnter &&
-            _aiScoutMission.ExposureStartedMs < 0d &&
-            IsScoutCurrentlyVisibleToPlayer(scout))
-        {
-            _aiScoutMission.ExposureStartedMs = _elapsedMs;
-        }
-
-        if (!HasActiveScoutPlan() &&
-            !TryPlanScoutSector(scout, basePosition, baseTile, fallback, allowRepeat: true, out _))
-        {
-            return fallback;
-        }
-
-        switch (_aiScoutMission.Phase)
-        {
-            case ScoutMissionPhase.ApproachEdge:
-                if (ScoutReachedPoint(scout, _aiScoutMission.EntryPoint, ScoutEntryArrivalDistance))
-                {
-                    StartScoutPeek(ScoutMissionPhase.Peek);
-                    return _aiScoutMission.PeekPoint;
-                }
-
-                return _aiScoutMission.EntryPoint;
-
-            case ScoutMissionPhase.Peek:
-            case ScoutMissionPhase.ReEnter:
-                var reachedPeekPoint = ScoutReachedPoint(scout, _aiScoutMission.PeekPoint, ScoutPeekCompletionDistance);
-                var hasVisibleCommit = _aiScoutMission.ExposureStartedMs >= 0d || IsScoutCurrentlyVisibleToPlayer(scout);
-                if (ShouldBreakScoutContact(scout, threat) ||
-                    (reachedPeekPoint && hasVisibleCommit))
-                {
-                    StartScoutBreakContact();
-                    return GetScoutBreakContactTarget(scout, fallback);
-                }
-
-                return _aiScoutMission.PeekPoint;
-
-            case ScoutMissionPhase.BreakContact:
-                if (ScoutReachedPoint(scout, _aiScoutMission.PlannedExitPoint, ScoutEntryArrivalDistance) ||
-                    ScoutReachedPoint(scout, _aiScoutMission.FallbackExitPoint, GameConstants.TileSize * 1.5f) ||
-                    !IsPlayerVisibleTile(Map.WorldToTile(scout.Position).X, Map.WorldToTile(scout.Position).Y))
-                {
-                    _aiScoutMission.Phase = ScoutMissionPhase.Reposition;
-                    _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-                    return _aiScoutMission.FallbackExitPoint == Vector2.Zero ? fallback : _aiScoutMission.FallbackExitPoint;
-                }
-
-                return GetScoutBreakContactTarget(scout, fallback);
-
-            case ScoutMissionPhase.Reposition:
-                if (CanScoutReEnter(scout, threat) &&
-                    TryPlanScoutSector(
-                        scout,
-                        basePosition,
-                        baseTile,
-                        fallback,
-                        allowRepeat: Init.Difficulty == Difficulty.Easy,
-                        out _))
-                {
-                    if (ScoutReachedPoint(scout, _aiScoutMission.EntryPoint, ScoutEntryArrivalDistance))
-                    {
-                        StartScoutPeek(ScoutMissionPhase.ReEnter);
-                        return _aiScoutMission.PeekPoint;
-                    }
-
-                    return _aiScoutMission.EntryPoint;
-                }
-
-                if (threat is not null && scout.Position.DistanceTo(threat.Position) <= GameConstants.TileSize * 3.4f)
-                {
-                    StartScoutBreakContact();
-                    return GetScoutBreakContactTarget(scout, fallback);
-                }
-
-                return _aiScoutMission.FallbackExitPoint == Vector2.Zero ? fallback : _aiScoutMission.FallbackExitPoint;
-
-            default:
-                if (TryPlanScoutSector(scout, basePosition, baseTile, fallback, allowRepeat: true, out _))
-                {
-                    _aiScoutMission.Phase = ScoutMissionPhase.ApproachEdge;
-                    _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-                    return _aiScoutMission.EntryPoint;
-                }
-
-                return fallback;
-        }
-    }
-
-    private void ResetScoutMission()
-    {
-        ReleaseScoutLock();
-        _aiScoutMission.Reset();
-        _aiWorkerScoutId = null;
-    }
-
-    private void ReleaseScoutLock()
-    {
-        if (_aiScoutMission.ScoutUnitId.HasValue)
-        {
-            var scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiScoutMission.ScoutUnitId.Value);
-            if (scout is not null)
-            {
-                scout.IsNonCombatScout = false;
-            }
-        }
-    }
-
-    private bool HasActiveScoutPlan()
-    {
-        return _aiScoutMission.EntryPoint != Vector2.Zero &&
-               _aiScoutMission.PeekPoint != Vector2.Zero &&
-               _aiScoutMission.PlannedExitPoint != Vector2.Zero &&
-               _aiScoutMission.FallbackExitPoint != Vector2.Zero;
-    }
-
-    private bool TryPlanScoutSector(
-        SimUnit scout,
-        Vector2 basePosition,
-        Vector2I baseTile,
-        Vector2 fallback,
-        bool allowRepeat,
-        out ScoutSectorOption plan)
-    {
-        if (!ShouldUseFrontierScoutCheat())
-        {
-            return TryPlanLegacyScoutSector(scout, basePosition, baseTile, fallback, allowRepeat, out plan);
-        }
-
-        return TryPlanFrontierScoutSector(scout, basePosition, baseTile, fallback, allowRepeat, out plan);
-    }
-
-    private bool TryPlanLegacyScoutSector(
-        SimUnit scout,
-        Vector2 basePosition,
-        Vector2I baseTile,
-        Vector2 fallback,
-        bool allowRepeat,
-        out ScoutSectorOption plan)
-    {
-        var outerRadiusTiles = int.Max(5, Mathf.RoundToInt((scout.Sight * GameConstants.TileSize - GameConstants.TileSize * 1.4f) / GameConstants.TileSize));
-        var peekRadiusTiles = int.Max(3, outerRadiusTiles - 2);
-        var sectorDirections = new[]
-        {
-            new Vector2(0f, 1f),
-            new Vector2(0.75f, 0.75f),
-            new Vector2(1f, 0f),
-            new Vector2(0.75f, -0.75f),
-            new Vector2(0f, -1f),
-            new Vector2(-0.75f, -0.75f),
-            new Vector2(-1f, 0f),
-            new Vector2(-0.75f, 0.75f)
-        };
-        var candidates = new List<ScoutSectorAnchor>();
-        for (var sectorIndex = 0; sectorIndex < sectorDirections.Length; sectorIndex++)
-        {
-            var direction = sectorDirections[sectorIndex].Normalized();
-            var entryTile = baseTile + new Vector2I(
-                Mathf.RoundToInt(direction.X * outerRadiusTiles),
-                Mathf.RoundToInt(direction.Y * outerRadiusTiles));
-            var peekTile = baseTile + new Vector2I(
-                Mathf.RoundToInt(direction.X * peekRadiusTiles),
-                Mathf.RoundToInt(direction.Y * peekRadiusTiles));
-            if (!TryFindWalkableRaidPoint(entryTile, 0, 2, scout.Position, out var entryPoint) ||
-                !TryFindWalkableRaidPoint(peekTile, 0, 2, entryPoint, out var peekPoint))
-            {
-                continue;
-            }
-
-            if (entryPoint.DistanceTo(peekPoint) < GameConstants.TileSize * 1.2f)
-            {
-                continue;
-            }
-
-            candidates.Add(new ScoutSectorAnchor(sectorIndex, entryPoint, peekPoint));
-        }
-
-        var bestScore = float.PositiveInfinity;
-        var bestPlan = default(ScoutSectorOption);
-        foreach (var candidate in candidates)
-        {
-            var repeatPenalty = 0f;
-            if (!allowRepeat)
-            {
-                if (_aiScoutMission.CurrentSector == candidate.SectorIndex)
-                {
-                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty * 1.2f;
-                }
-
-                if (_aiScoutMission.LastSector == candidate.SectorIndex)
-                {
-                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty;
-                }
-            }
-
-            var threat = EstimateScoutSectorThreat(candidate.PeekPoint);
-            if (_aiScoutMission.WorkerFallback &&
-                threat > _difficultyDefinition.ScoutThreatTolerance + 0.35f)
-            {
-                continue;
-            }
-
-            var intel = EvaluateScoutIntel(candidate.PeekPoint);
-            var exitPoint = fallback;
-            var fallbackExitPoint = fallback;
-            var exitScore = float.PositiveInfinity;
-            var fallbackExitScore = float.PositiveInfinity;
-            foreach (var exitCandidate in candidates)
-            {
-                if (exitCandidate.SectorIndex == candidate.SectorIndex)
-                {
-                    continue;
-                }
-
-                var score = EstimateScoutSectorThreat(exitCandidate.EntryPoint) * 22f +
-                            exitCandidate.EntryPoint.DistanceTo(candidate.PeekPoint) * 0.16f;
-                if (score < exitScore)
-                {
-                    fallbackExitScore = exitScore;
-                    fallbackExitPoint = exitPoint;
-                    exitScore = score;
-                    exitPoint = exitCandidate.EntryPoint;
-                }
-                else if (score < fallbackExitScore)
-                {
-                    fallbackExitScore = score;
-                    fallbackExitPoint = exitCandidate.EntryPoint;
-                }
-            }
-
-            var scoreValue = scout.Position.DistanceTo(candidate.EntryPoint) * 0.22f +
-                             candidate.EntryPoint.DistanceTo(candidate.PeekPoint) * 0.12f +
-                             Mathf.Max(0f, threat - _difficultyDefinition.ScoutThreatTolerance) * 28f +
-                             repeatPenalty +
-                             intel.Score;
-            if (scoreValue < bestScore)
-            {
-                bestScore = scoreValue;
-                bestPlan = new ScoutSectorOption(
-                    candidate.SectorIndex,
-                    candidate.EntryPoint,
-                    candidate.PeekPoint,
-                    exitPoint,
-                    fallbackExitPoint,
-                    intel.Kind,
-                    0,
-                    0,
-                    scoreValue);
-            }
-        }
-
-        plan = bestPlan;
-        if (bestScore == float.PositiveInfinity)
-        {
-            return false;
-        }
-
-        if (_aiScoutMission.CurrentSector != plan.SectorIndex)
-        {
-            _aiScoutMission.LastSector = _aiScoutMission.CurrentSector;
-        }
-
-        _aiScoutMission.CurrentSector = plan.SectorIndex;
-        _aiScoutMission.EntryPoint = plan.EntryPoint;
-        _aiScoutMission.PeekPoint = plan.PeekPoint;
-        _aiScoutMission.PlannedExitPoint = plan.ExitPoint;
-        _aiScoutMission.FallbackExitPoint = plan.FallbackExitPoint;
-        _aiScoutMission.ExposureStartedMs = -99999d;
-        _aiScoutMission.LastIntelTargetKind = plan.IntelKind;
-        _aiScoutMission.CurrentRouteExposure = plan.RouteExposure;
-        _aiScoutMission.CurrentVisibleRunLength = plan.VisibleRunLength;
-        _aiScoutMission.PeekCompleted = false;
-        return true;
-    }
-
-    private bool ShouldUseFrontierScoutCheat()
-    {
-        return Difficulty != Difficulty.Easy &&
-               _playerVisionSnapshot is { HasData: true };
-    }
-
-    private bool TryPlanFrontierScoutSector(
-        SimUnit scout,
-        Vector2 basePosition,
-        Vector2I baseTile,
-        Vector2 fallback,
-        bool allowRepeat,
-        out ScoutSectorOption plan)
-    {
-        plan = default;
-        var frontierCandidates = CollectFrontierCandidatesAroundBase(scout, basePosition, baseTile);
-        if (frontierCandidates.Count == 0)
-        {
-            return false;
-        }
-
-        var routeCandidates = new List<ScoutSectorOption>();
-        foreach (var frontier in frontierCandidates)
-        {
-            if (BuildScoutRouteCandidate(scout, frontier, fallback, out var routeCandidate))
-            {
-                routeCandidates.Add(routeCandidate);
-            }
-        }
-
-        if (routeCandidates.Count == 0)
-        {
-            return false;
-        }
-
-        if (_aiScoutMission.RequireSectorSwitch)
-        {
-            var switchedCandidates = SelectNextScoutSectorExcludingLast(routeCandidates, _aiScoutMission.CurrentSector);
-            if (switchedCandidates.Count == 0)
-            {
-                return false;
-            }
-
-            routeCandidates = switchedCandidates;
-        }
-        else if (!allowRepeat && _aiScoutMission.LastSector >= 0)
-        {
-            var saferCandidates = SelectNextScoutSectorExcludingLast(routeCandidates, _aiScoutMission.LastSector);
-            if (saferCandidates.Count > 0)
-            {
-                routeCandidates = saferCandidates;
-            }
-        }
-
-        var bestScore = float.PositiveInfinity;
-        var bestPlan = default(ScoutSectorOption);
-        foreach (var candidate in routeCandidates)
-        {
-            var repeatPenalty = 0f;
-            if (!allowRepeat)
-            {
-                if (_aiScoutMission.CurrentSector == candidate.SectorIndex)
-                {
-                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty * 1.2f;
-                }
-
-                if (_aiScoutMission.LastSector == candidate.SectorIndex)
-                {
-                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty;
-                }
-            }
-
-            var score = candidate.Score + repeatPenalty;
-            if (score < bestScore)
-            {
-                bestScore = score;
-                bestPlan = candidate;
-            }
-        }
-
-        if (bestScore == float.PositiveInfinity)
-        {
-            return false;
-        }
-
-        if (_aiScoutMission.CurrentSector != bestPlan.SectorIndex)
-        {
-            _aiScoutMission.LastSector = _aiScoutMission.CurrentSector;
-        }
-
-        _aiScoutMission.CurrentSector = bestPlan.SectorIndex;
-        _aiScoutMission.EntryPoint = bestPlan.EntryPoint;
-        _aiScoutMission.PeekPoint = bestPlan.PeekPoint;
-        _aiScoutMission.PlannedExitPoint = bestPlan.ExitPoint;
-        _aiScoutMission.FallbackExitPoint = bestPlan.FallbackExitPoint;
-        _aiScoutMission.ExposureStartedMs = -99999d;
-        _aiScoutMission.LastIntelTargetKind = bestPlan.IntelKind;
-        _aiScoutMission.CurrentRouteExposure = bestPlan.RouteExposure;
-        _aiScoutMission.CurrentVisibleRunLength = bestPlan.VisibleRunLength;
-        plan = bestPlan;
-        return true;
-    }
-
-    private List<ScoutSectorOption> SelectNextScoutSectorExcludingLast(List<ScoutSectorOption> candidates, int excludedSector)
-    {
-        if (excludedSector < 0)
-        {
-            return candidates;
-        }
-
-        var filtered = candidates.FindAll(candidate => candidate.SectorIndex != excludedSector);
-        return filtered;
-    }
-
-    private List<ScoutFrontierCandidate> CollectFrontierCandidatesAroundBase(SimUnit scout, Vector2 basePosition, Vector2I baseTile)
-    {
-        var result = new List<ScoutFrontierCandidate>();
-        if (!ShouldUseFrontierScoutCheat())
-        {
-            return result;
-        }
-
-        var searchRadiusTiles = int.Max(scout.Sight + 5, 12);
-        var minX = int.Max(0, baseTile.X - searchRadiusTiles);
-        var maxX = int.Min(Map.Width - 1, baseTile.X + searchRadiusTiles);
-        var minY = int.Max(0, baseTile.Y - searchRadiusTiles);
-        var maxY = int.Min(Map.Height - 1, baseTile.Y + searchRadiusTiles);
-
-        for (var ty = minY; ty <= maxY; ty++)
-        {
-            for (var tx = minX; tx <= maxX; tx++)
-            {
-                if (!IsFrontierTile(tx, ty))
-                {
-                    continue;
-                }
-
-                var entryPoint = Map.TileToWorldCenter(tx, ty);
-                var distanceToBase = entryPoint.DistanceTo(basePosition);
-                if (distanceToBase > GameConstants.TileSize * searchRadiusTiles ||
-                    distanceToBase < GameConstants.TileSize * 3.2f)
-                {
-                    continue;
-                }
-
-                if (!TryGetFrontierPeekTile(new Vector2I(tx, ty), basePosition, out var peekTile))
-                {
-                    continue;
-                }
-
-                var peekPoint = Map.TileToWorldCenter(peekTile.X, peekTile.Y);
-                var sectorIndex = GetScoutSectorIndex(basePosition, entryPoint);
-                result.Add(new ScoutFrontierCandidate(sectorIndex, new Vector2I(tx, ty), peekTile, entryPoint, peekPoint));
-            }
-        }
-
-        return result;
-    }
-
-    private bool TryGetFrontierPeekTile(Vector2I frontierTile, Vector2 basePosition, out Vector2I peekTile)
-    {
-        peekTile = frontierTile;
-        var bestScore = float.PositiveInfinity;
-        var found = false;
-        for (var depth = 1; depth <= FrontierScoutMaxPeekDepthTiles; depth++)
-        {
-            for (var dy = -depth; dy <= depth; dy++)
-            {
-                for (var dx = -depth; dx <= depth; dx++)
-                {
-                    if ((dx == 0 && dy == 0) ||
-                        int.Max(Math.Abs(dx), Math.Abs(dy)) != depth)
-                    {
-                        continue;
-                    }
-
-                    var tx = frontierTile.X + dx;
-                    var ty = frontierTile.Y + dy;
-                    if (!Map.InBounds(tx, ty) ||
-                        !Map.IsWalkable(tx, ty) ||
-                        !IsPlayerVisibleTile(tx, ty))
-                    {
-                        continue;
-                    }
-
-                    var world = Map.TileToWorldCenter(tx, ty);
-                    var depthPenalty = Math.Abs(depth - FrontierScoutPreferredPeekDepthTiles) * 14f;
-                    var score = world.DistanceTo(basePosition) * 0.05f +
-                                EstimateScoutSectorThreat(world) * 12f +
-                                EvaluateScoutIntel(world).Score +
-                                depthPenalty;
-                    if (score < bestScore)
-                    {
-                        bestScore = score;
-                        peekTile = new Vector2I(tx, ty);
-                        found = true;
-                    }
-                }
-            }
-        }
-
-        return found;
-    }
-
-    private bool BuildScoutRouteCandidate(
-        SimUnit scout,
-        ScoutFrontierCandidate frontier,
-        Vector2 fallback,
-        out ScoutSectorOption candidate)
-    {
-        candidate = default;
-        if (!TryBuildScoutPathTiles(scout, scout.Position, frontier.EntryPoint, 0f, out var routeToEntry) ||
-            !TryBuildScoutPathTiles(scout, frontier.EntryPoint, frontier.PeekPoint, GameConstants.TileSize * 0.2f, out var routeToPeek) ||
-            !TryBuildScoutPathTiles(scout, frontier.PeekPoint, frontier.EntryPoint, 0f, out var routeToExit) ||
-            !TryFindScoutExitRoute(scout, frontier.EntryPoint, fallback, out var fallbackExitPoint, out var routeToFallback))
-        {
-            return false;
-        }
-
-        var exposure = EvaluateScoutRouteExposure(routeToEntry, routeToPeek, routeToExit, routeToFallback);
-        if (!IsScoutRouteExposureSafe(scout, exposure))
-        {
-            return false;
-        }
-
-        var threat = EstimateScoutSectorThreat(frontier.PeekPoint);
-        if (_aiScoutMission.WorkerFallback &&
-            threat > _difficultyDefinition.ScoutThreatTolerance + 0.35f)
-        {
-            return false;
-        }
-
-        var intel = EvaluateScoutIntel(frontier.PeekPoint);
-        var score = scout.Position.DistanceTo(frontier.EntryPoint) * 0.18f +
-                    frontier.EntryPoint.DistanceTo(frontier.PeekPoint) * 0.1f +
-                    Mathf.Max(0f, threat - _difficultyDefinition.ScoutThreatTolerance) * 28f +
-                    exposure.TotalVisibleTiles * 26f +
-                    exposure.LongestVisibleRun * 32f +
-                    intel.Score;
-        candidate = new ScoutSectorOption(
-            frontier.SectorIndex,
-            frontier.EntryPoint,
-            frontier.PeekPoint,
-            frontier.EntryPoint,
-            fallbackExitPoint,
-            intel.Kind,
-            exposure.TotalVisibleTiles,
-            exposure.LongestVisibleRun,
-            score);
-        return true;
-    }
-
-    private bool TryFindScoutExitRoute(
-        SimUnit scout,
-        Vector2 exitPoint,
-        Vector2 fallback,
-        out Vector2 fallbackExitPoint,
-        out List<Vector2I> routeToFallback)
-    {
-        fallbackExitPoint = Vector2.Zero;
-        routeToFallback = [];
-        if (!TryBuildScoutPathTiles(scout, exitPoint, fallback, 0f, out routeToFallback))
-        {
-            return false;
-        }
-
-        fallbackExitPoint = fallback;
-        return true;
-    }
-
-    private bool TryBuildScoutPathTiles(
-        SimUnit scout,
-        Vector2 startWorld,
-        Vector2 targetWorld,
-        float arrivalRadius,
-        out List<Vector2I> tilePath)
-    {
-        tilePath = [];
-        var start = Map.WorldToTile(startWorld);
-        var goal = Map.WorldToTile(targetWorld);
-        if (!Map.InBounds(start.X, start.Y) || !Map.InBounds(goal.X, goal.Y))
-        {
-            return false;
-        }
-
-        var goalRadiusTiles = int.Max(0, Mathf.CeilToInt(arrivalRadius / GameConstants.TileSize));
-        var tilePenalty = BuildDynamicTilePenalty(scout, goal, goalRadiusTiles, stuckReroute: false);
-        tilePath = Pathfinder.FindPath(Map, start, goal, goalRadiusTiles, scout.Id % 8, tilePenalty);
-        return tilePath.Count > 0;
-    }
-
-    private ScoutRouteExposure EvaluateScoutRouteExposure(params List<Vector2I>[] routeSegments)
-    {
-        var totalVisibleTiles = 0;
-        var longestVisibleRun = 0;
-        var currentRun = 0;
-        var entryVisibleTiles = 0;
-        var peekVisibleTiles = 0;
-        var exitVisibleTiles = 0;
-        var fallbackVisibleTiles = 0;
-
-        for (var segmentIndex = 0; segmentIndex < routeSegments.Length; segmentIndex++)
-        {
-            foreach (var tile in routeSegments[segmentIndex])
-            {
-                if (IsPlayerVisibleTile(tile.X, tile.Y))
-                {
-                    totalVisibleTiles++;
-                    currentRun++;
-                    longestVisibleRun = int.Max(longestVisibleRun, currentRun);
-                    switch (segmentIndex)
-                    {
-                        case 0:
-                            entryVisibleTiles++;
-                            break;
-                        case 1:
-                            peekVisibleTiles++;
-                            break;
-                        case 2:
-                            exitVisibleTiles++;
-                            break;
-                        case 3:
-                            fallbackVisibleTiles++;
-                            break;
-                    }
-                }
-                else
-                {
-                    currentRun = 0;
-                }
-            }
-        }
-
-        return new ScoutRouteExposure(totalVisibleTiles, longestVisibleRun, entryVisibleTiles, peekVisibleTiles, exitVisibleTiles, fallbackVisibleTiles);
-    }
-
-    private bool IsScoutRouteExposureSafe(SimUnit scout, ScoutRouteExposure exposure)
-    {
-        var maxVisibleTiles = int.Max(3, Mathf.CeilToInt(scout.Speed * (_difficultyDefinition.ScoutMaxExposureMs / 1000f) / GameConstants.TileSize) + 2);
-        var maxVisibleRunTiles = int.Max(2, maxVisibleTiles - 2);
-        if (exposure.EntryVisibleTiles > ScoutMaxVisibleEntryTiles)
-        {
-            return false;
-        }
-
-        if (exposure.TotalVisibleTiles > maxVisibleTiles)
-        {
-            return false;
-        }
-
-        if (exposure.LongestVisibleRun > maxVisibleRunTiles)
-        {
-            return false;
-        }
-
-        if (exposure.PeekVisibleTiles < ScoutMinPeekVisibleTiles || exposure.ExitVisibleTiles > maxVisibleRunTiles)
-        {
-            return false;
-        }
-
-        return exposure.FallbackVisibleTiles <= maxVisibleTiles;
-    }
-
-    private bool IsScoutCurrentlyVisibleToPlayer(SimUnit scout)
-    {
-        var tile = Map.WorldToTile(scout.Position);
-        return IsPlayerVisibleTile(tile.X, tile.Y);
-    }
-
-    private bool IsImmediateScoutThreat(SimUnit scout, ICombatTarget threat)
-    {
-        if (threat is SimUnit enemy)
-        {
-            var distance = scout.Position.DistanceTo(enemy.Position);
-            var threatRange = enemy.Range + scout.Radius + enemy.Radius + ScoutDangerBuffer * 0.35f;
-            return enemy.TargetCombat == scout || distance <= threatRange;
-        }
-
-        if (threat is SimBuilding building)
-        {
-            var distance = scout.Position.DistanceTo(building.Center);
-            var threatRange = building.Range + scout.Radius + ScoutDangerBuffer * 0.2f;
-            return distance <= threatRange;
-        }
-
-        return false;
-    }
-
-    private bool IsPlayerVisibleTile(int tx, int ty)
-    {
-        return _playerVisionSnapshot is not null && _playerVisionSnapshot.IsVisible(tx, ty);
-    }
-
-    private bool IsFrontierTile(int tx, int ty)
-    {
-        if (!Map.InBounds(tx, ty) || !Map.IsWalkable(tx, ty) || IsPlayerVisibleTile(tx, ty))
-        {
-            return false;
-        }
-
-        for (var dy = -1; dy <= 1; dy++)
-        {
-            for (var dx = -1; dx <= 1; dx++)
-            {
-                if (dx == 0 && dy == 0)
-                {
-                    continue;
-                }
-
-                var nx = tx + dx;
-                var ny = ty + dy;
-                if (Map.InBounds(nx, ny) && IsPlayerVisibleTile(nx, ny))
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static int GetScoutSectorIndex(Vector2 origin, Vector2 point)
-    {
-        var direction = point - origin;
-        if (direction.LengthSquared() <= 0.01f)
-        {
-            return 0;
-        }
-
-        var angle = Mathf.PosMod(Mathf.Atan2(direction.Y, direction.X) + Mathf.Pi / 8f, Mathf.Tau);
-        return Mathf.Clamp((int)(angle / (Mathf.Tau / 8f)), 0, 7);
-    }
-
-    private ScoutIntelInfo EvaluateScoutIntel(Vector2 position)
-    {
-        var workers = CountKnownWorkersNear(position, GameConstants.TileSize * 3.1f);
-        if (workers > 0)
-        {
-            return new ScoutIntelInfo(ScoutIntelTargetKind.WorkerLine, -165f - workers * 16f);
-        }
-
-        if (HasKnownTowerNear(position, GameConstants.TileSize * 3.2f))
-        {
-            return new ScoutIntelInfo(ScoutIntelTargetKind.TowerPerimeter, -108f);
-        }
-
-        if (HasKnownOuterTargetNear(position, GameConstants.TileSize * 3.3f))
-        {
-            return new ScoutIntelInfo(ScoutIntelTargetKind.OuterBuilding, -88f);
-        }
-
-        if (CountKnownCombatUnitsNear(position, GameConstants.TileSize * 3.6f) > 0)
-        {
-            return new ScoutIntelInfo(ScoutIntelTargetKind.ArmyEdge, -72f);
-        }
-
-        return new ScoutIntelInfo(ScoutIntelTargetKind.BaseEdge, -32f);
-    }
-
-    private float EstimateScoutSectorThreat(Vector2 position)
-    {
-        return EstimateKnownThreatAt(position, ScoutSectorThreatRadius);
-    }
-
-    private void StartScoutPeek(ScoutMissionPhase phase)
-    {
-        _aiScoutMission.Phase = phase;
-        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-        _aiScoutMission.ExposureStartedMs = -99999d;
-        _aiScoutMission.PeekCompleted = false;
-        _aiScoutMission.RequireSectorSwitch = false;
-    }
-
-    private void StartScoutBreakContact()
-    {
-        _aiScoutMission.Phase = ScoutMissionPhase.BreakContact;
-        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-        _aiScoutMission.PeekCompleted = true;
-        _aiScoutMission.RequireSectorSwitch = true;
-    }
-
-    private bool ShouldBreakScoutContact(SimUnit scout, ICombatTarget? threat)
-    {
-        var inPlayerVision = IsScoutCurrentlyVisibleToPlayer(scout);
-        var visibleCommitMs = _aiScoutMission.ExposureStartedMs >= 0d
-            ? _elapsedMs - _aiScoutMission.ExposureStartedMs
-            : 0d;
-        if (threat is not null)
-        {
-            if (!inPlayerVision || visibleCommitMs < ScoutMinVisibleCommitMs)
-            {
-                return IsImmediateScoutThreat(scout, threat);
-            }
-
-            return true;
-        }
-
-        if (_aiScoutMission.ExposureStartedMs >= 0d &&
-            _elapsedMs - _aiScoutMission.ExposureStartedMs >= _difficultyDefinition.ScoutMaxExposureMs)
-        {
-            return true;
-        }
-
-        if (!inPlayerVision || visibleCommitMs < ScoutMinVisibleCommitMs)
-        {
-            return false;
-        }
-
-        var localThreat = EstimateScoutSectorThreat(scout.Position);
-        return localThreat > _difficultyDefinition.ScoutThreatTolerance + (_aiScoutMission.WorkerFallback ? 0.2f : 0.75f);
-    }
-
-    private bool CanScoutReEnter(SimUnit scout, ICombatTarget? threat)
-    {
-        if (threat is not null)
-        {
-            return false;
-        }
-
-        if (_elapsedMs - Math.Max(_aiScoutMission.LastThreatMs, _aiScoutMission.PhaseEnteredMs) < _difficultyDefinition.ScoutReentryDelayMs)
-        {
-            return false;
-        }
-
-        if (EstimateScoutSectorThreat(scout.Position) > _difficultyDefinition.ScoutThreatTolerance * 0.7f + 0.3f)
-        {
-            return false;
-        }
-
-        return scout.Position.DistanceTo(_aiScoutMission.PlannedExitPoint) <= GameConstants.TileSize * 1.75f ||
-               scout.Position.DistanceTo(_aiScoutMission.FallbackExitPoint) <= GameConstants.TileSize * 1.75f ||
-               scout.Position.DistanceTo(_aiScoutMission.BasePosition) >= scout.Sight * GameConstants.TileSize;
-    }
-
-    private Vector2 GetScoutBreakContactTarget(SimUnit scout, Vector2 fallback)
-    {
-        var best = fallback;
-        var bestScore = float.PositiveInfinity;
-        var options = new[] { _aiScoutMission.PlannedExitPoint, _aiScoutMission.FallbackExitPoint, fallback };
-        foreach (var point in options)
-        {
-            if (point == Vector2.Zero)
-            {
-                continue;
-            }
-
-            var score = scout.Position.DistanceTo(point) * 0.2f +
-                        EstimateScoutSectorThreat(point) * 24f;
-            if (_aiScoutMission.LastThreatPosition.HasValue)
-            {
-                score -= point.DistanceTo(_aiScoutMission.LastThreatPosition.Value) * 0.48f;
-            }
-
-            if (score < bestScore)
-            {
-                bestScore = score;
-                best = point;
-            }
-        }
-
-        return best;
-    }
-
-    private static bool ScoutReachedPoint(SimUnit scout, Vector2 point, float distance)
-    {
-        return point != Vector2.Zero && scout.Position.DistanceTo(point) <= distance;
-    }
-
-    private ICombatTarget? FindScoutThreat(SimUnit scout)
-    {
-        ICombatTarget? best = null;
-        var bestScore = float.PositiveInfinity;
-        foreach (var enemy in Units)
-        {
-            if (!enemy.Alive || enemy.Side == scout.Side || !enemy.CanAttack())
-            {
-                continue;
-            }
-
-            var distance = scout.Position.DistanceTo(enemy.Position);
-            if (distance > scout.Sight * GameConstants.TileSize + GameConstants.TileSize)
-            {
-                continue;
-            }
-
-            var threatRange = enemy.Range + scout.Radius + enemy.Radius + ScoutDangerBuffer;
-            var canThreaten = distance <= threatRange || enemy.TargetCombat == scout || enemy.Speed >= scout.Speed * 0.92f;
-            if (!canThreaten)
-            {
-                continue;
-            }
-
-            var score = distance - enemy.Speed * 0.35f;
-            if (enemy.TargetCombat == scout)
-            {
-                score -= 40f;
-            }
-
-            if (score < bestScore)
-            {
-                bestScore = score;
-                best = enemy;
-            }
-        }
-
-        foreach (var building in Buildings)
-        {
-            if (!building.Alive || building.Side == scout.Side || !building.CanAttack())
-            {
-                continue;
-            }
-
-            var distance = scout.Position.DistanceTo(building.Center);
-            var threatRange = building.Range + scout.Radius + ScoutDangerBuffer;
-            if (distance > scout.Sight * GameConstants.TileSize + GameConstants.TileSize ||
-                distance > threatRange + GameConstants.TileSize * 0.75f)
-            {
-                continue;
-            }
-
-            var score = distance - 24f;
-            if (score < bestScore)
-            {
-                bestScore = score;
-                best = building;
-            }
-        }
-
-        return best;
     }
 
     private void CommandSquad(
@@ -5847,24 +4697,6 @@ public sealed class GameSimulation
         FallbackBuilding
     }
 
-    private enum ScoutMissionPhase
-    {
-        ApproachEdge,
-        Peek,
-        BreakContact,
-        Reposition,
-        ReEnter
-    }
-
-    private enum ScoutIntelTargetKind
-    {
-        BaseEdge,
-        WorkerLine,
-        OuterBuilding,
-        TowerPerimeter,
-        ArmyEdge
-    }
-
     private sealed class AiMemory
     {
         public Dictionary<int, AiKnownUnit> Units { get; } = [];
@@ -5920,82 +4752,8 @@ public sealed class GameSimulation
         }
     }
 
-    private sealed class ScoutMissionState
-    {
-        public bool Active { get; set; }
-        public int? ScoutUnitId { get; set; }
-        public bool WorkerFallback { get; set; }
-        public ScoutMissionPhase Phase { get; set; } = ScoutMissionPhase.ApproachEdge;
-        public double PhaseEnteredMs { get; set; }
-        public double LastThreatMs { get; set; } = -99999d;
-        public double ConfirmedBaseMs { get; set; } = -99999d;
-        public double ExposureStartedMs { get; set; } = -99999d;
-        public Vector2 BasePosition { get; set; }
-        public Vector2I? BaseTile { get; set; }
-        public Vector2 RecoverPoint { get; set; }
-        public Vector2? LastThreatPosition { get; set; }
-        public int CurrentSector { get; set; } = -1;
-        public int LastSector { get; set; } = -1;
-        public Vector2 EntryPoint { get; set; }
-        public Vector2 PeekPoint { get; set; }
-        public Vector2 PlannedExitPoint { get; set; }
-        public Vector2 FallbackExitPoint { get; set; }
-        public int CurrentRouteExposure { get; set; }
-        public int CurrentVisibleRunLength { get; set; }
-        public bool PeekCompleted { get; set; }
-        public bool RequireSectorSwitch { get; set; }
-        public ScoutIntelTargetKind LastIntelTargetKind { get; set; } = ScoutIntelTargetKind.BaseEdge;
-
-        public void Reset()
-        {
-            Active = false;
-            ScoutUnitId = null;
-            WorkerFallback = false;
-            Phase = ScoutMissionPhase.ApproachEdge;
-            PhaseEnteredMs = 0d;
-            LastThreatMs = -99999d;
-            ConfirmedBaseMs = -99999d;
-            ExposureStartedMs = -99999d;
-            BasePosition = Vector2.Zero;
-            BaseTile = null;
-            RecoverPoint = Vector2.Zero;
-            LastThreatPosition = null;
-            CurrentSector = -1;
-            LastSector = -1;
-            EntryPoint = Vector2.Zero;
-            PeekPoint = Vector2.Zero;
-            PlannedExitPoint = Vector2.Zero;
-            FallbackExitPoint = Vector2.Zero;
-            CurrentRouteExposure = 0;
-            CurrentVisibleRunLength = 0;
-            PeekCompleted = false;
-            RequireSectorSwitch = false;
-            LastIntelTargetKind = ScoutIntelTargetKind.BaseEdge;
-        }
-    }
-
     private sealed record AiKnownUnit(int Id, UnitKind Kind, Vector2 Position, float Power, double LastSeenMs);
     private sealed record AiKnownBuilding(int Id, BuildingKind Kind, Vector2 Position, Vector2I CenterTile, int MaxHp, double LastSeenMs);
     private readonly record struct HarassObjective(HarassTargetKind Kind, Vector2 Position, int? EntityId, float Score);
-    private readonly record struct ScoutSectorAnchor(int SectorIndex, Vector2 EntryPoint, Vector2 PeekPoint);
-    private readonly record struct ScoutFrontierCandidate(int SectorIndex, Vector2I EntryTile, Vector2I PeekTile, Vector2 EntryPoint, Vector2 PeekPoint);
-    private readonly record struct ScoutSectorOption(
-        int SectorIndex,
-        Vector2 EntryPoint,
-        Vector2 PeekPoint,
-        Vector2 ExitPoint,
-        Vector2 FallbackExitPoint,
-        ScoutIntelTargetKind IntelKind,
-        int RouteExposure,
-        int VisibleRunLength,
-        float Score);
-    private readonly record struct ScoutIntelInfo(ScoutIntelTargetKind Kind, float Score);
-    private readonly record struct ScoutRouteExposure(
-        int TotalVisibleTiles,
-        int LongestVisibleRun,
-        int EntryVisibleTiles,
-        int PeekVisibleTiles,
-        int ExitVisibleTiles,
-        int FallbackVisibleTiles);
     private readonly record struct AiSquadMetrics(Vector2 Center, float Power, float SlowestSpeed, int FrontlineCount, int BacklineCount, int SiegeCount, int Count);
 }
