@@ -18,6 +18,18 @@ public sealed class GameSimulation
     private const float CombatBuildingTargetPenalty = 72f;
     private const float CombatRetargetBuffer = 18f;
     private const float AiAssaultStandoffDistance = GameConstants.TileSize * 3f;
+    private const float HeavyRerouteCooldownMs = 450f;
+    private const float HarassRecoverDurationMs = 3200f;
+    private const float HarassNoTradeWindowMs = 2500f;
+    private const float HarassRaidActivationDistance = GameConstants.TileSize * 2.5f;
+    private const float HarassThreatRadius = GameConstants.TileSize * 5.5f;
+    private const float HarassRepeatPenaltyDistance = GameConstants.TileSize * 3.5f;
+    private const float ScoutQuietWindowMs = 1800f;
+    private const float ScoutContinueAfterConfirmMs = 5200f;
+    private const float ScoutDangerBuffer = GameConstants.TileSize * 1.75f;
+    private const float ScoutSectorThreatRadius = GameConstants.TileSize * 4.5f;
+    private const float ScoutPeekArrivalDistance = GameConstants.TileSize * 1.15f;
+    private const float ScoutEntryArrivalDistance = GameConstants.TileSize * 0.95f;
 
     public event Action<Vector2, Vector2, GameSide, bool, bool>? ProjectileLaunched;
     public event Action<Vector2, bool, int>? HitOccurred;
@@ -34,8 +46,11 @@ public sealed class GameSimulation
     private double _aiTickAccumMs;
     private readonly DifficultyDefinition _difficultyDefinition;
     private readonly AiMemory _aiMemory = new();
+    private readonly HarassMissionState _aiHarassMission = new();
+    private readonly ScoutMissionState _aiScoutMission = new();
     private AiState _aiState = AiState.Open;
     private double _aiStateEnteredMs;
+    private int? _aiWorkerScoutId;
     private double _aiLastScoutCommandMs = -99999d;
     private double _aiLastHarassCommandMs = -99999d;
     private double _aiLastMainCommandMs = -99999d;
@@ -185,6 +200,12 @@ public sealed class GameSimulation
             return;
         }
 
+        if (unit.IsNonCombatScout)
+        {
+            IssueMove(unit, worldTarget);
+            return;
+        }
+
         unit.ClearOrders();
         unit.AttackMoveTarget = worldTarget;
         Repath(unit, worldTarget, 0f);
@@ -194,6 +215,11 @@ public sealed class GameSimulation
     public void IssueAttack(SimUnit unit, ICombatTarget target)
     {
         if (!unit.Alive || !target.Alive || unit.Side == target.Side || !unit.CanAttack())
+        {
+            return;
+        }
+
+        if (unit.IsNonCombatScout)
         {
             return;
         }
@@ -246,7 +272,7 @@ public sealed class GameSimulation
         unit.ReturnBuilding = hall;
         unit.Path.Clear();
         var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        Repath(unit, hall.Center, reach);
+        Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach);
         unit.SetState(UnitState.ReturnCargo);
     }
 
@@ -487,7 +513,7 @@ public sealed class GameSimulation
 
     private void TickIdle(SimUnit unit)
     {
-        if (!unit.CanAttack())
+        if (!unit.CanAttack() || unit.IsNonCombatScout)
         {
             return;
         }
@@ -583,6 +609,7 @@ public sealed class GameSimulation
         if (target is SimUnit victim &&
             victim.Alive &&
             victim.CanAttack() &&
+            !victim.IsNonCombatScout &&
             victim.TargetCombat is null)
         {
             if (victim.IsWorker() && TryTriggerWorkerDefenseOrEvade(victim, unit))
@@ -629,7 +656,7 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, node.Center, reach);
+                Repath(unit, GetWorkerGatherPathTarget(unit, node), reach);
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -684,7 +711,7 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, hall.Center, reach);
+                Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach);
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -815,6 +842,10 @@ public sealed class GameSimulation
         }
 
         target.TakeDamage(amount);
+        if (source is SimUnit unitSource && unitSource.Side == GameSide.AI)
+        {
+            RegisterHarassTrade(unitSource, target, amount);
+        }
         HitOccurred?.Invoke(target.Position, target.IsBuilding, amount);
         if (target.Side == GameSide.Player && source.Side == GameSide.AI)
         {
@@ -1328,12 +1359,14 @@ public sealed class GameSimulation
         worker.ClearOrders();
     }
 
-    private void Repath(SimUnit unit, Vector2 worldTarget, float arrivalRadius)
+    private bool Repath(SimUnit unit, Vector2 worldTarget, float arrivalRadius, bool stuckReroute = false, bool preserveExistingPathOnFailure = false)
     {
         var start = Map.WorldToTile(unit.Position);
         var goal = Map.WorldToTile(worldTarget);
         var goalRadiusTiles = int.Max(0, Mathf.CeilToInt(arrivalRadius / GameConstants.TileSize));
-        var tilePenalty = BuildDynamicTilePenalty(unit, goal, goalRadiusTiles);
+        var previousPath = preserveExistingPathOnFailure ? new List<Vector2>(unit.Path) : null;
+        var previousDestination = unit.PathDestination;
+        var tilePenalty = BuildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
         var tilePath = Pathfinder.FindPath(
             Map,
             start,
@@ -1341,6 +1374,21 @@ public sealed class GameSimulation
             goalRadiusTiles,
             unit.Id % 8,
             tilePenalty);
+        if (tilePath.Count == 0)
+        {
+            if (preserveExistingPathOnFailure && previousPath is not null)
+            {
+                unit.SetPath(previousPath);
+                unit.PathDestination = previousDestination;
+                return false;
+            }
+
+            unit.SetPath(Array.Empty<Vector2>());
+            unit.PathDestination = worldTarget;
+            unit.PathRepathMs = 0d;
+            return false;
+        }
+
         var worldPath = new List<Vector2>(tilePath.Count);
         foreach (var point in tilePath)
         {
@@ -1350,11 +1398,18 @@ public sealed class GameSimulation
         unit.SetPath(worldPath);
         unit.PathDestination = worldPath.Count > 0 ? worldPath[^1] : worldTarget;
         unit.PathRepathMs = 0d;
+        if (stuckReroute)
+        {
+            unit.LastHeavyRerouteMs = _elapsedMs;
+        }
+
+        return true;
     }
 
-    private Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles)
+    private Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
     {
         var penalty = new Dictionary<int, float>();
+        var goalWorld = Map.TileToWorldCenter(goal.X, goal.Y);
         foreach (var other in Units)
         {
             if (!other.Alive || other == unit)
@@ -1369,12 +1424,30 @@ public sealed class GameSimulation
             }
 
             var goalSlack = goalRadiusTiles + 1;
-            if (Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack)
+            var nearGoal = Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack;
+            if (!nearGoal)
+            {
+                AddTilePenalty(penalty, occupied.X, occupied.Y, 7f);
+                for (var dy = -1; dy <= 1; dy++)
+                {
+                    for (var dx = -1; dx <= 1; dx++)
+                    {
+                        if ((dx == 0 && dy == 0) || !Map.InBounds(occupied.X + dx, occupied.Y + dy))
+                        {
+                            continue;
+                        }
+
+                        AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, 1.25f);
+                    }
+                }
+            }
+
+            if (!stuckReroute || !ShouldTreatAsTemporaryBlocker(unit, other, goalWorld, goalRadiusTiles))
             {
                 continue;
             }
 
-            AddTilePenalty(penalty, occupied.X, occupied.Y, 7f);
+            AddTilePenalty(penalty, occupied.X, occupied.Y, 220f);
             for (var dy = -1; dy <= 1; dy++)
             {
                 for (var dx = -1; dx <= 1; dx++)
@@ -1384,7 +1457,7 @@ public sealed class GameSimulation
                         continue;
                     }
 
-                    AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, 1.25f);
+                    AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, 42f);
                 }
             }
         }
@@ -1392,13 +1465,85 @@ public sealed class GameSimulation
         return penalty;
     }
 
+    private bool ShouldTreatAsTemporaryBlocker(SimUnit mover, SimUnit other, Vector2 goalWorld, int goalRadiusTiles)
+    {
+        if (!IsLikelyStaticBlocker(other))
+        {
+            return false;
+        }
+
+        var corridorRadius = GameConstants.TileSize * 1.6f;
+        var nearGoalRadius = (goalRadiusTiles + 2f) * GameConstants.TileSize;
+        var nearGoal = other.Position.DistanceTo(goalWorld) <= nearGoalRadius;
+        var inCorridor = DistanceToSegment(other.Position, mover.Position, goalWorld) <= corridorRadius;
+        if (!nearGoal && !inCorridor)
+        {
+            return false;
+        }
+
+        if (mover.TargetCombat is not null && other.TargetCombat == mover.TargetCombat)
+        {
+            return true;
+        }
+
+        if (mover.TargetResource is not null && other.TargetResource == mover.TargetResource)
+        {
+            return true;
+        }
+
+        if (mover.ReturnBuilding is not null && other.ReturnBuilding == mover.ReturnBuilding)
+        {
+            return true;
+        }
+
+        if (mover.TargetBuilding is not null && other.TargetBuilding == mover.TargetBuilding)
+        {
+            return true;
+        }
+
+        return nearGoal || inCorridor;
+    }
+
+    private static bool IsLikelyStaticBlocker(SimUnit unit)
+    {
+        if (unit.State is UnitState.Attack or UnitState.Gather or UnitState.Build or UnitState.ReturnCargo)
+        {
+            return true;
+        }
+
+        if (unit.State is UnitState.Move or UnitState.AttackMove)
+        {
+            return unit.Path.Count == 0 || unit.StuckAccumMs >= 180d;
+        }
+
+        return unit.State == UnitState.Idle;
+    }
+
+    private static float DistanceToSegment(Vector2 point, Vector2 start, Vector2 end)
+    {
+        var segment = end - start;
+        var lengthSquared = segment.LengthSquared();
+        if (lengthSquared <= 0.01f)
+        {
+            return point.DistanceTo(start);
+        }
+
+        var t = Mathf.Clamp((point - start).Dot(segment) / lengthSquared, 0f, 1f);
+        var projection = start + segment * t;
+        return point.DistanceTo(projection);
+    }
+
     private bool AdvanceWithRecovery(SimUnit unit, double delta)
     {
         if (!unit.Alive || unit.Path.Count == 0)
         {
             unit.StuckAccumMs = 0d;
+            unit.PathProgressStallMs = 0d;
+            unit.LastPathProgressMetric = float.PositiveInfinity;
             return false;
         }
+
+        UpdatePathProgressState(unit, delta);
 
         var before = unit.Position;
         var pathCountBefore = unit.Path.Count;
@@ -1417,7 +1562,8 @@ public sealed class GameSimulation
             unit.StuckAccumMs = 0d;
         }
 
-        if (hasPath && unit.StuckAccumMs >= GameConstants.StuckRepathDelayMs)
+        if (hasPath && (unit.StuckAccumMs >= GameConstants.StuckRepathDelayMs ||
+                        unit.PathProgressStallMs >= GameConstants.StuckRepathDelayMs))
         {
             ResolveLocalStuck(unit);
         }
@@ -1425,15 +1571,158 @@ public sealed class GameSimulation
         return hasPath;
     }
 
+    private void UpdatePathProgressState(SimUnit unit, double delta)
+    {
+        var currentMetric = ComputePathProgressMetric(unit);
+        if (float.IsPositiveInfinity(unit.LastPathProgressMetric) ||
+            currentMetric + GameConstants.PathProgressImprovementEpsilon < unit.LastPathProgressMetric)
+        {
+            unit.LastPathProgressMetric = currentMetric;
+            unit.PathProgressStallMs = 0d;
+            return;
+        }
+
+        unit.PathProgressStallMs += delta * 1000d;
+    }
+
+    private static float ComputePathProgressMetric(SimUnit unit)
+    {
+        if (unit.Path.Count == 0)
+        {
+            return 0f;
+        }
+
+        var remaining = unit.Position.DistanceTo(unit.Path[0]);
+        for (var index = 1; index < unit.Path.Count; index++)
+        {
+            remaining += unit.Path[index - 1].DistanceTo(unit.Path[index]);
+        }
+
+        return remaining;
+    }
+
     private void ResolveLocalStuck(SimUnit unit)
     {
         unit.StuckAccumMs = 0d;
-        TryLocalAvoidanceStep(unit);
+        unit.PathProgressStallMs = 0d;
+        if (TryLocalAvoidanceStep(unit))
+        {
+            if (_elapsedMs - unit.LastHeavyRerouteMs < HeavyRerouteCooldownMs)
+            {
+                return;
+            }
+        }
+
+        if (TryGetRepathTarget(unit, out var repathTarget))
+        {
+            if (_elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
+            {
+                var arrivalRadius = GetArrivalRadius(unit);
+                Repath(unit, repathTarget, arrivalRadius, stuckReroute: true, preserveExistingPathOnFailure: true);
+            }
+        }
+    }
+
+    private bool TryGetRepathTarget(SimUnit unit, out Vector2 target)
+    {
+        if (unit.TargetCombat is { Alive: true } combat)
+        {
+            target = combat.Position;
+            return true;
+        }
+
+        if (unit.TargetResource is { Alive: true } resource)
+        {
+            target = GetWorkerGatherPathTarget(unit, resource);
+            return true;
+        }
+
+        if (unit.ReturnBuilding is { Alive: true } hall)
+        {
+            target = GetWorkerReturnPathTarget(unit, hall);
+            return true;
+        }
+
+        if (unit.TargetBuilding is { Alive: true } site)
+        {
+            target = site.Center;
+            return true;
+        }
+
         if (unit.PathDestination.HasValue)
         {
-            var arrivalRadius = GetArrivalRadius(unit);
-            Repath(unit, unit.PathDestination.Value, arrivalRadius);
+            target = unit.PathDestination.Value;
+            return true;
         }
+
+        target = Vector2.Zero;
+        return false;
+    }
+
+    private Vector2 GetWorkerGatherPathTarget(SimUnit unit, SimResourceNode node)
+    {
+        if (!unit.IsWorker())
+        {
+            return node.Center;
+        }
+
+        var hall = unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit);
+        if (hall is null)
+        {
+            return node.Center;
+        }
+
+        return TryBuildWorkerFlowTarget(hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: false, out var target)
+            ? target
+            : node.Center;
+    }
+
+    private Vector2 GetWorkerReturnPathTarget(SimUnit unit, SimBuilding hall)
+    {
+        if (!unit.IsWorker())
+        {
+            return hall.Center;
+        }
+
+        if (unit.TargetResource is not { Alive: true } node)
+        {
+            return hall.Center;
+        }
+
+        return TryBuildWorkerFlowTarget(hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: true, out var target)
+            ? target
+            : hall.Center;
+    }
+
+    private static bool TryBuildWorkerFlowTarget(
+        Vector2 hallCenter,
+        float hallRadius,
+        Vector2 nodeCenter,
+        float nodeRadius,
+        bool approachingHall,
+        out Vector2 target)
+    {
+        var route = nodeCenter - hallCenter;
+        if (route.LengthSquared() <= 4f)
+        {
+            target = Vector2.Zero;
+            return false;
+        }
+
+        var routeDirection = route.Normalized();
+        var perpendicular = new Vector2(-routeDirection.Y, routeDirection.X);
+        var laneOffset = perpendicular * GameConstants.WorkerFlowLaneOffset;
+
+        if (approachingHall)
+        {
+            var depth = Mathf.Max(GameConstants.TileSize * 0.35f, hallRadius * 0.62f);
+            target = hallCenter + routeDirection * depth - laneOffset;
+            return true;
+        }
+
+        var depthToNode = Mathf.Max(GameConstants.TileSize * 0.35f, nodeRadius * 0.58f);
+        target = nodeCenter - routeDirection * depthToNode + laneOffset;
+        return true;
     }
 
     private float GetArrivalRadius(SimUnit unit)
@@ -1461,17 +1750,17 @@ public sealed class GameSimulation
         return 0f;
     }
 
-    private void TryLocalAvoidanceStep(SimUnit unit)
+    private bool TryLocalAvoidanceStep(SimUnit unit)
     {
         if (unit.Path.Count == 0)
         {
-            return;
+            return false;
         }
 
         var direction = unit.Path[0] - unit.Position;
         if (direction.LengthSquared() <= 0.01f)
         {
-            return;
+            return false;
         }
 
         direction = direction.Normalized();
@@ -1488,9 +1777,11 @@ public sealed class GameSimulation
         {
             if (TryMoveIntoFreeSpace(unit, offset))
             {
-                return;
+                return true;
             }
         }
+
+        return false;
     }
 
     private bool TryMoveIntoFreeSpace(SimUnit unit, Vector2 offset)
@@ -1553,12 +1844,133 @@ public sealed class GameSimulation
                     continue;
                 }
 
+                if (TryResolveHeadOnDeadlock(first, second, deltaVector, minimum))
+                {
+                    continue;
+                }
+
                 var push = (float)(((minimum - distance) / 2f) * strength);
                 var normal = deltaVector / distance;
                 TryNudge(first, -normal * push);
                 TryNudge(second, normal * push);
             }
         }
+    }
+
+    private bool TryResolveHeadOnDeadlock(SimUnit first, SimUnit second, Vector2 deltaVector, float minimum)
+    {
+        var firstDirection = GetPathTravelDirection(first);
+        var secondDirection = GetPathTravelDirection(second);
+        if (firstDirection == Vector2.Zero || secondDirection == Vector2.Zero)
+        {
+            return false;
+        }
+
+        if (firstDirection.Dot(secondDirection) > -0.45f)
+        {
+            return false;
+        }
+
+        var axis = deltaVector.Normalized();
+        var firstFacing = firstDirection.Dot(axis);
+        var secondFacing = secondDirection.Dot(-axis);
+        if (firstFacing < 0.35f || secondFacing < 0.35f)
+        {
+            return false;
+        }
+
+        var overlap = Mathf.Max(0f, minimum - deltaVector.Length());
+        if (overlap < GameConstants.DeadlockResolveMinOverlap || !IsDeadlockResolutionReady(first, second))
+        {
+            return false;
+        }
+
+        var leader = CompareMovementPriority(first, second) <= 0 ? first : second;
+        var yielder = leader == first ? second : first;
+        var leaderDirection = leader == first ? firstDirection : secondDirection;
+        var sideSign = yielder.Id % 2 == 0 ? 1f : -1f;
+        var lateral = new Vector2(-leaderDirection.Y, leaderDirection.X) * sideSign;
+        var yieldStep = Mathf.Clamp(
+            overlap * 0.55f + GameConstants.LocalAvoidanceStep * 0.2f,
+            GameConstants.DeadlockYieldMinStep,
+            GameConstants.DeadlockYieldMaxStep);
+        var forwardBias = leaderDirection * (yieldStep * 0.25f);
+        var backBias = -leaderDirection * (yieldStep * 0.45f);
+        var offsets = new[]
+        {
+            lateral * yieldStep + forwardBias,
+            -lateral * yieldStep + forwardBias,
+            lateral * (yieldStep * 0.65f) + backBias,
+            -lateral * (yieldStep * 0.65f) + backBias
+        };
+
+        foreach (var offset in offsets)
+        {
+            if (!TryMoveIntoFreeSpace(yielder, offset))
+            {
+                continue;
+            }
+
+            yielder.StuckAccumMs = 0d;
+            yielder.PathProgressStallMs = 0d;
+            yielder.LastPathProgressMetric = float.PositiveInfinity;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsDeadlockResolutionReady(SimUnit first, SimUnit second)
+    {
+        var triggerMs = GameConstants.DeadlockResolveTriggerMs;
+        var firstStalled = first.PathProgressStallMs >= triggerMs || first.StuckAccumMs >= triggerMs;
+        var secondStalled = second.PathProgressStallMs >= triggerMs || second.StuckAccumMs >= triggerMs;
+        return firstStalled && secondStalled;
+    }
+
+    private static Vector2 GetPathTravelDirection(SimUnit unit)
+    {
+        if (unit.Path.Count == 0)
+        {
+            return Vector2.Zero;
+        }
+
+        for (var index = 0; index < unit.Path.Count; index++)
+        {
+            var direction = unit.Path[index] - unit.Position;
+            if (direction.LengthSquared() > 1f)
+            {
+                return direction.Normalized();
+            }
+        }
+
+        return Vector2.Zero;
+    }
+
+    private static int CompareMovementPriority(SimUnit first, SimUnit second)
+    {
+        var firstPriority = GetMovementPriority(first);
+        var secondPriority = GetMovementPriority(second);
+        if (firstPriority != secondPriority)
+        {
+            return secondPriority.CompareTo(firstPriority);
+        }
+
+        return first.Id.CompareTo(second.Id);
+    }
+
+    private static int GetMovementPriority(SimUnit unit)
+    {
+        return unit.State switch
+        {
+            UnitState.Attack => 5,
+            UnitState.ReturnCargo => 4,
+            UnitState.Gather => 4,
+            UnitState.Build => 4,
+            UnitState.Move => 3,
+            UnitState.AttackMove => 3,
+            _ => 1
+        };
     }
 
     private void TryNudge(SimUnit unit, Vector2 offset)
@@ -1717,16 +2129,19 @@ public sealed class GameSimulation
         var hasWorkshop = buildings.Exists(building => building.Kind == BuildingKind.Workshop && building.Completed);
         var barracks = buildings.Find(building => building.Kind == BuildingKind.Barracks && building.Completed);
         var workshop = buildings.Find(building => building.Kind == BuildingKind.Workshop && building.Completed);
-        BuildAiSquads(army, out var mainArmy, out var harassSquad);
-        var mainMetrics = CalculateSquadMetrics(mainArmy);
-        var harassMetrics = CalculateSquadMetrics(harassSquad);
+        var armyMetrics = CalculateSquadMetrics(army);
         var knownEnemyPower = EstimateKnownEnemyPower();
         var pressure = KnownEnemyPressureNear(hall.Center, GameConstants.TileSize * _difficultyDefinition.DefendRadiusTiles);
         var confirmedBase = _aiMemory.LastKnownPlayerBase;
         var suspectedBase = confirmedBase ?? Map.TileToWorldCenter(Layout.PlayerBase.X, Layout.PlayerBase.Y);
+        var allowHarassSplit = ShouldUseHarassSplit(hasBarracks, confirmedBase.HasValue, pressure, armyMetrics, knownEnemyPower);
+        BuildAiSquads(army, allowHarassSplit, out var mainArmy, out var harassSquad);
+        var mainMetrics = CalculateSquadMetrics(mainArmy);
+        var harassMetrics = CalculateSquadMetrics(harassSquad);
         var nextState = DetermineAiState(
             hall,
             hasBarracks,
+            armyMetrics,
             mainMetrics,
             harassMetrics,
             confirmedBase.HasValue,
@@ -1736,6 +2151,25 @@ public sealed class GameSimulation
         {
             _aiState = nextState;
             _aiStateEnteredMs = _elapsedMs;
+        }
+
+        if (_aiState != AiState.Scout || confirmedBase.HasValue)
+        {
+            _aiWorkerScoutId = null;
+        }
+
+        if (_aiState != AiState.Scout)
+        {
+            ResetScoutMission();
+        }
+
+        if (_aiState == AiState.Harass)
+        {
+            SyncHarassMissionMembers(harassSquad, units);
+        }
+        else
+        {
+            ResetHarassMission(preserveHistory: true);
         }
 
         MaintainAiEconomy(
@@ -1983,6 +2417,7 @@ public sealed class GameSimulation
     private AiState DetermineAiState(
         SimBuilding hall,
         bool hasBarracks,
+        AiSquadMetrics armyMetrics,
         AiSquadMetrics mainMetrics,
         AiSquadMetrics harassMetrics,
         bool baseConfirmed,
@@ -1994,7 +2429,17 @@ public sealed class GameSimulation
             return AiState.Defend;
         }
 
-        if (ShouldFinish(mainMetrics, knownEnemyPower))
+        if (_aiState == AiState.Harass && (ShouldFinish(armyMetrics, knownEnemyPower) || ShouldPush(armyMetrics, knownEnemyPower)))
+        {
+            return AiState.Regroup;
+        }
+
+        if (_aiState == AiState.Scout && ShouldContinueScoutMission(baseConfirmed))
+        {
+            return AiState.Scout;
+        }
+
+        if (ShouldFinish(armyMetrics, knownEnemyPower))
         {
             return AiState.Finish;
         }
@@ -2011,7 +2456,7 @@ public sealed class GameSimulation
 
         if (_aiState == AiState.Push || _aiState == AiState.Finish)
         {
-            return ShouldRetreat(mainMetrics, knownEnemyPower) ? AiState.Regroup : _aiState;
+            return ShouldRetreat(armyMetrics, knownEnemyPower) ? AiState.Regroup : _aiState;
         }
 
         if (_aiState == AiState.Harass && harassMetrics.Count > 0 && _elapsedMs - _aiStateEnteredMs < 5200d)
@@ -2029,12 +2474,47 @@ public sealed class GameSimulation
             return AiState.Harass;
         }
 
-        if (ShouldPush(mainMetrics, knownEnemyPower))
+        if (ShouldPush(armyMetrics, knownEnemyPower))
         {
             return AiState.Push;
         }
 
-        return mainMetrics.Count >= 3 ? AiState.Regroup : AiState.Boom;
+        return armyMetrics.Count >= 3 ? AiState.Regroup : AiState.Boom;
+    }
+
+    private bool ShouldContinueScoutMission(bool baseConfirmed)
+    {
+        if (!_aiScoutMission.Active)
+        {
+            return false;
+        }
+
+        if (!baseConfirmed)
+        {
+            return true;
+        }
+
+        return _elapsedMs - _aiScoutMission.ConfirmedBaseMs <= ScoutContinueAfterConfirmMs;
+    }
+
+    private bool ShouldUseHarassSplit(
+        bool hasBarracks,
+        bool baseConfirmed,
+        bool pressure,
+        AiSquadMetrics armyMetrics,
+        float knownEnemyPower)
+    {
+        if (Init.AiProfile != AiProfile.Harass || pressure || !hasBarracks || !baseConfirmed)
+        {
+            return false;
+        }
+
+        if (_aiState is AiState.Push or AiState.Finish or AiState.Regroup)
+        {
+            return false;
+        }
+
+        return !ShouldFinish(armyMetrics, knownEnemyPower) && !ShouldPush(armyMetrics, knownEnemyPower);
     }
 
     private bool ShouldPush(AiSquadMetrics mainMetrics, float knownEnemyPower)
@@ -2294,7 +2774,7 @@ public sealed class GameSimulation
 
             case AiState.Harass:
                 CommandSquad(mainArmy, stagePoint, suspectedBase, false, false, true);
-                CommandSquad(harassSquad, FindHarassTargetPosition(suspectedBase, hall.Center), suspectedBase, true, true, false);
+                CommandHarassSquad(harassSquad, harassMetrics, hall, stagePoint, suspectedBase);
                 _aiLastHarassCommandMs = _elapsedMs;
                 break;
 
@@ -2311,35 +2791,26 @@ public sealed class GameSimulation
 
     private void CommandScout(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 stagePoint)
     {
-        SimUnit? scout = null;
-        foreach (var unit in mainArmy)
+        var scout = SelectScoutUnit(mainArmy, workersFallback, suspectedBase, stagePoint);
+        if (scout is null)
         {
-            if (unit.Kind != UnitKind.Catapult && (scout is null || unit.Speed > scout.Speed))
+            ResetScoutMission();
+            foreach (var unit in mainArmy)
             {
-                scout = unit;
+                CommandUnitMove(unit, stagePoint);
             }
+
+            return;
         }
 
-        if (scout is null && workersFallback)
+        EnsureScoutMission(scout, suspectedBase, stagePoint);
+        var scoutTarget = UpdateScoutMission(scout, suspectedBase, stagePoint);
+        if (_elapsedMs - _aiLastScoutCommandMs > 420d ||
+            scout.State != UnitState.Move ||
+            !scout.PathDestination.HasValue ||
+            scout.PathDestination.Value.DistanceTo(scoutTarget) > 18f)
         {
-            foreach (var worker in Units)
-            {
-                if (!worker.Alive || worker.Side != GameSide.AI || !worker.IsWorker())
-                {
-                    continue;
-                }
-
-                if (worker.State is UnitState.Idle or UnitState.Gather)
-                {
-                    scout = worker;
-                    break;
-                }
-            }
-        }
-
-        if (scout is not null && _elapsedMs - _aiLastScoutCommandMs > 1800d)
-        {
-            CommandUnitMove(scout, suspectedBase);
+            CommandUnitMove(scout, scoutTarget);
             _aiLastScoutCommandMs = _elapsedMs;
         }
 
@@ -2350,6 +2821,581 @@ public sealed class GameSimulation
                 CommandUnitMove(unit, stagePoint);
             }
         }
+    }
+
+    private SimUnit? SelectScoutUnit(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 fallback)
+    {
+        SimUnit? scout = null;
+        if (_aiScoutMission.ScoutUnitId.HasValue)
+        {
+            scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiScoutMission.ScoutUnitId.Value);
+            if (scout is not null)
+            {
+                return scout;
+            }
+
+            ResetScoutMission();
+        }
+
+        var bestScore = float.NegativeInfinity;
+        foreach (var unit in mainArmy)
+        {
+            var score = EvaluateScoutCandidate(unit);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                scout = unit;
+            }
+        }
+
+        if (scout is not null)
+        {
+            _aiWorkerScoutId = null;
+            return scout;
+        }
+
+        if (!workersFallback)
+        {
+            return null;
+        }
+
+        if (_aiWorkerScoutId.HasValue)
+        {
+            scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiWorkerScoutId.Value);
+            if (scout is not null &&
+                scout.IsWorker() &&
+                scout.State is UnitState.Idle or UnitState.Gather &&
+                CanWorkerScoutSafely(scout, suspectedBase, fallback))
+            {
+                return scout;
+            }
+
+            _aiWorkerScoutId = null;
+        }
+
+        foreach (var worker in Units)
+        {
+            if (!worker.Alive || worker.Side != GameSide.AI || !worker.IsWorker())
+            {
+                continue;
+            }
+
+            if (worker.State is not (UnitState.Idle or UnitState.Gather) ||
+                !CanWorkerScoutSafely(worker, suspectedBase, fallback))
+            {
+                continue;
+            }
+
+            _aiWorkerScoutId = worker.Id;
+            return worker;
+        }
+
+        return null;
+    }
+
+    private float EvaluateScoutCandidate(SimUnit unit)
+    {
+        if (!unit.Alive || unit.Kind == UnitKind.Catapult)
+        {
+            return float.NegativeInfinity;
+        }
+
+        var durability = unit.MaxHp <= 0 ? 0f : unit.Hp / (float)unit.MaxHp;
+        var kindBonus = unit.Kind switch
+        {
+            UnitKind.Knight => 90f,
+            UnitKind.Archer => 56f,
+            UnitKind.Footman => 34f,
+            UnitKind.Worker => -140f,
+            _ => 0f
+        };
+        var rangedSafety = unit.IsRanged() ? 12f : 0f;
+        var combatPenalty = unit.State == UnitState.Attack ? 10f : 0f;
+        return unit.Speed * 2.4f +
+               unit.Sight * 20f +
+               unit.Hp * 0.08f +
+               durability * 55f +
+               rangedSafety +
+               kindBonus -
+               combatPenalty;
+    }
+
+    private bool CanWorkerScoutSafely(SimUnit worker, Vector2 suspectedBase, Vector2 fallback)
+    {
+        if (!worker.Alive || !worker.IsWorker())
+        {
+            return false;
+        }
+
+        var basePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
+        var baseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(basePosition);
+        return TryPlanScoutSector(worker, basePosition, baseTile, fallback, allowRepeat: true, out _);
+    }
+
+    private void EnsureScoutMission(SimUnit scout, Vector2 suspectedBase, Vector2 fallback)
+    {
+        if (_aiScoutMission.Active && _aiScoutMission.ScoutUnitId == scout.Id)
+        {
+            scout.IsNonCombatScout = true;
+            scout.TargetCombat = null;
+            return;
+        }
+
+        ReleaseScoutLock();
+        _aiScoutMission.Reset();
+        _aiScoutMission.Active = true;
+        _aiScoutMission.ScoutUnitId = scout.Id;
+        _aiScoutMission.WorkerFallback = scout.IsWorker();
+        _aiScoutMission.BaseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(suspectedBase);
+        _aiScoutMission.BasePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
+        _aiScoutMission.RecoverPoint = fallback;
+        _aiScoutMission.Phase = ScoutMissionPhase.ApproachEdge;
+        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
+        _aiScoutMission.LastThreatMs = -99999d;
+        _aiScoutMission.ConfirmedBaseMs = _aiMemory.LastKnownPlayerBase.HasValue ? _elapsedMs : -99999d;
+        _aiScoutMission.ExposureStartedMs = -99999d;
+        _aiScoutMission.CurrentSector = -1;
+        _aiScoutMission.LastSector = -1;
+        scout.IsNonCombatScout = true;
+        scout.TargetCombat = null;
+        TryPlanScoutSector(scout, _aiScoutMission.BasePosition, _aiScoutMission.BaseTile!.Value, fallback, allowRepeat: Init.Difficulty == Difficulty.Easy, out _);
+    }
+
+    private Vector2 UpdateScoutMission(SimUnit scout, Vector2 suspectedBase, Vector2 fallback)
+    {
+        scout.IsNonCombatScout = true;
+        scout.TargetCombat = null;
+
+        var basePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
+        var baseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(basePosition);
+        _aiScoutMission.BasePosition = basePosition;
+        _aiScoutMission.BaseTile = baseTile;
+        _aiScoutMission.RecoverPoint = fallback;
+        if (_aiMemory.LastKnownPlayerBase.HasValue && _aiScoutMission.ConfirmedBaseMs < 0d)
+        {
+            _aiScoutMission.ConfirmedBaseMs = _elapsedMs;
+        }
+
+        var threat = FindScoutThreat(scout);
+        if (threat is not null)
+        {
+            _aiScoutMission.LastThreatMs = _elapsedMs;
+            _aiScoutMission.LastThreatPosition = threat.Position;
+        }
+
+        if (!HasActiveScoutPlan() &&
+            !TryPlanScoutSector(scout, basePosition, baseTile, fallback, allowRepeat: true, out _))
+        {
+            return fallback;
+        }
+
+        switch (_aiScoutMission.Phase)
+        {
+            case ScoutMissionPhase.ApproachEdge:
+                if (ScoutReachedPoint(scout, _aiScoutMission.EntryPoint, ScoutEntryArrivalDistance))
+                {
+                    StartScoutPeek(ScoutMissionPhase.Peek);
+                    return _aiScoutMission.PeekPoint;
+                }
+
+                return _aiScoutMission.EntryPoint;
+
+            case ScoutMissionPhase.Peek:
+            case ScoutMissionPhase.ReEnter:
+                if (ShouldBreakScoutContact(scout, threat) ||
+                    ScoutReachedPoint(scout, _aiScoutMission.PeekPoint, ScoutPeekArrivalDistance))
+                {
+                    StartScoutBreakContact();
+                    return GetScoutBreakContactTarget(scout, fallback);
+                }
+
+                return _aiScoutMission.PeekPoint;
+
+            case ScoutMissionPhase.BreakContact:
+                if (CanScoutReEnter(scout, threat) &&
+                    TryPlanScoutSector(
+                        scout,
+                        basePosition,
+                        baseTile,
+                        fallback,
+                        allowRepeat: Init.Difficulty == Difficulty.Easy,
+                        out _))
+                {
+                    _aiScoutMission.Phase = ScoutMissionPhase.Reposition;
+                    _aiScoutMission.PhaseEnteredMs = _elapsedMs;
+                    return _aiScoutMission.EntryPoint;
+                }
+
+                return GetScoutBreakContactTarget(scout, fallback);
+
+            case ScoutMissionPhase.Reposition:
+                if (ScoutReachedPoint(scout, _aiScoutMission.EntryPoint, ScoutEntryArrivalDistance))
+                {
+                    StartScoutPeek(ScoutMissionPhase.ReEnter);
+                    return _aiScoutMission.PeekPoint;
+                }
+
+                if (threat is not null && scout.Position.DistanceTo(threat.Position) <= GameConstants.TileSize * 3.4f)
+                {
+                    StartScoutBreakContact();
+                    return GetScoutBreakContactTarget(scout, fallback);
+                }
+
+                return _aiScoutMission.EntryPoint;
+
+            default:
+                if (TryPlanScoutSector(scout, basePosition, baseTile, fallback, allowRepeat: true, out _))
+                {
+                    _aiScoutMission.Phase = ScoutMissionPhase.ApproachEdge;
+                    _aiScoutMission.PhaseEnteredMs = _elapsedMs;
+                    return _aiScoutMission.EntryPoint;
+                }
+
+                return fallback;
+        }
+    }
+
+    private void ResetScoutMission()
+    {
+        ReleaseScoutLock();
+        _aiScoutMission.Reset();
+        _aiWorkerScoutId = null;
+    }
+
+    private void ReleaseScoutLock()
+    {
+        if (_aiScoutMission.ScoutUnitId.HasValue)
+        {
+            var scout = Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _aiScoutMission.ScoutUnitId.Value);
+            if (scout is not null)
+            {
+                scout.IsNonCombatScout = false;
+            }
+        }
+    }
+
+    private bool HasActiveScoutPlan()
+    {
+        return _aiScoutMission.EntryPoint != Vector2.Zero &&
+               _aiScoutMission.PeekPoint != Vector2.Zero;
+    }
+
+    private bool TryPlanScoutSector(
+        SimUnit scout,
+        Vector2 basePosition,
+        Vector2I baseTile,
+        Vector2 fallback,
+        bool allowRepeat,
+        out ScoutSectorOption plan)
+    {
+        var outerRadiusTiles = int.Max(5, Mathf.RoundToInt((scout.Sight * GameConstants.TileSize - GameConstants.TileSize * 1.4f) / GameConstants.TileSize));
+        var peekRadiusTiles = int.Max(3, outerRadiusTiles - 2);
+        var sectorDirections = new[]
+        {
+            new Vector2(0f, 1f),
+            new Vector2(0.75f, 0.75f),
+            new Vector2(1f, 0f),
+            new Vector2(0.75f, -0.75f),
+            new Vector2(0f, -1f),
+            new Vector2(-0.75f, -0.75f),
+            new Vector2(-1f, 0f),
+            new Vector2(-0.75f, 0.75f)
+        };
+        var candidates = new List<ScoutSectorAnchor>();
+        for (var sectorIndex = 0; sectorIndex < sectorDirections.Length; sectorIndex++)
+        {
+            var direction = sectorDirections[sectorIndex].Normalized();
+            var entryTile = baseTile + new Vector2I(
+                Mathf.RoundToInt(direction.X * outerRadiusTiles),
+                Mathf.RoundToInt(direction.Y * outerRadiusTiles));
+            var peekTile = baseTile + new Vector2I(
+                Mathf.RoundToInt(direction.X * peekRadiusTiles),
+                Mathf.RoundToInt(direction.Y * peekRadiusTiles));
+            if (!TryFindWalkableRaidPoint(entryTile, 0, 2, scout.Position, out var entryPoint) ||
+                !TryFindWalkableRaidPoint(peekTile, 0, 2, entryPoint, out var peekPoint))
+            {
+                continue;
+            }
+
+            if (entryPoint.DistanceTo(peekPoint) < GameConstants.TileSize * 1.2f)
+            {
+                continue;
+            }
+
+            candidates.Add(new ScoutSectorAnchor(sectorIndex, entryPoint, peekPoint));
+        }
+
+        var bestScore = float.PositiveInfinity;
+        var bestPlan = default(ScoutSectorOption);
+        foreach (var candidate in candidates)
+        {
+            var repeatPenalty = 0f;
+            if (!allowRepeat)
+            {
+                if (_aiScoutMission.CurrentSector == candidate.SectorIndex)
+                {
+                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty * 1.2f;
+                }
+
+                if (_aiScoutMission.LastSector == candidate.SectorIndex)
+                {
+                    repeatPenalty += _difficultyDefinition.ScoutSectorRepeatPenalty;
+                }
+            }
+
+            var threat = EstimateScoutSectorThreat(candidate.PeekPoint);
+            if (_aiScoutMission.WorkerFallback &&
+                threat > _difficultyDefinition.ScoutThreatTolerance + 0.35f)
+            {
+                continue;
+            }
+
+            var intel = EvaluateScoutIntel(candidate.PeekPoint);
+            var exitPoint = fallback;
+            var fallbackExitPoint = fallback;
+            var exitScore = float.PositiveInfinity;
+            var fallbackExitScore = float.PositiveInfinity;
+            foreach (var exitCandidate in candidates)
+            {
+                if (exitCandidate.SectorIndex == candidate.SectorIndex)
+                {
+                    continue;
+                }
+
+                var score = EstimateScoutSectorThreat(exitCandidate.EntryPoint) * 22f +
+                            exitCandidate.EntryPoint.DistanceTo(candidate.PeekPoint) * 0.16f;
+                if (score < exitScore)
+                {
+                    fallbackExitScore = exitScore;
+                    fallbackExitPoint = exitPoint;
+                    exitScore = score;
+                    exitPoint = exitCandidate.EntryPoint;
+                }
+                else if (score < fallbackExitScore)
+                {
+                    fallbackExitScore = score;
+                    fallbackExitPoint = exitCandidate.EntryPoint;
+                }
+            }
+
+            var scoreValue = scout.Position.DistanceTo(candidate.EntryPoint) * 0.22f +
+                             candidate.EntryPoint.DistanceTo(candidate.PeekPoint) * 0.12f +
+                             Mathf.Max(0f, threat - _difficultyDefinition.ScoutThreatTolerance) * 28f +
+                             repeatPenalty +
+                             intel.Score;
+            if (scoreValue < bestScore)
+            {
+                bestScore = scoreValue;
+                bestPlan = new ScoutSectorOption(
+                    candidate.SectorIndex,
+                    candidate.EntryPoint,
+                    candidate.PeekPoint,
+                    exitPoint,
+                    fallbackExitPoint,
+                    intel.Kind,
+                    scoreValue);
+            }
+        }
+
+        plan = bestPlan;
+        if (bestScore == float.PositiveInfinity)
+        {
+            return false;
+        }
+
+        if (_aiScoutMission.CurrentSector != plan.SectorIndex)
+        {
+            _aiScoutMission.LastSector = _aiScoutMission.CurrentSector;
+        }
+
+        _aiScoutMission.CurrentSector = plan.SectorIndex;
+        _aiScoutMission.EntryPoint = plan.EntryPoint;
+        _aiScoutMission.PeekPoint = plan.PeekPoint;
+        _aiScoutMission.PlannedExitPoint = plan.ExitPoint;
+        _aiScoutMission.FallbackExitPoint = plan.FallbackExitPoint;
+        _aiScoutMission.ExposureStartedMs = -99999d;
+        _aiScoutMission.LastIntelTargetKind = plan.IntelKind;
+        return true;
+    }
+
+    private ScoutIntelInfo EvaluateScoutIntel(Vector2 position)
+    {
+        var workers = CountKnownWorkersNear(position, GameConstants.TileSize * 3.1f);
+        if (workers > 0)
+        {
+            return new ScoutIntelInfo(ScoutIntelTargetKind.WorkerLine, -165f - workers * 16f);
+        }
+
+        if (HasKnownTowerNear(position, GameConstants.TileSize * 3.2f))
+        {
+            return new ScoutIntelInfo(ScoutIntelTargetKind.TowerPerimeter, -108f);
+        }
+
+        if (HasKnownOuterTargetNear(position, GameConstants.TileSize * 3.3f))
+        {
+            return new ScoutIntelInfo(ScoutIntelTargetKind.OuterBuilding, -88f);
+        }
+
+        if (CountKnownCombatUnitsNear(position, GameConstants.TileSize * 3.6f) > 0)
+        {
+            return new ScoutIntelInfo(ScoutIntelTargetKind.ArmyEdge, -72f);
+        }
+
+        return new ScoutIntelInfo(ScoutIntelTargetKind.BaseEdge, -32f);
+    }
+
+    private float EstimateScoutSectorThreat(Vector2 position)
+    {
+        return EstimateKnownThreatAt(position, ScoutSectorThreatRadius);
+    }
+
+    private void StartScoutPeek(ScoutMissionPhase phase)
+    {
+        _aiScoutMission.Phase = phase;
+        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
+        _aiScoutMission.ExposureStartedMs = _elapsedMs;
+    }
+
+    private void StartScoutBreakContact()
+    {
+        _aiScoutMission.Phase = ScoutMissionPhase.BreakContact;
+        _aiScoutMission.PhaseEnteredMs = _elapsedMs;
+    }
+
+    private bool ShouldBreakScoutContact(SimUnit scout, ICombatTarget? threat)
+    {
+        if (threat is not null)
+        {
+            return true;
+        }
+
+        if (_aiScoutMission.ExposureStartedMs >= 0d &&
+            _elapsedMs - _aiScoutMission.ExposureStartedMs >= _difficultyDefinition.ScoutMaxExposureMs)
+        {
+            return true;
+        }
+
+        var localThreat = EstimateScoutSectorThreat(scout.Position);
+        return localThreat > _difficultyDefinition.ScoutThreatTolerance + (_aiScoutMission.WorkerFallback ? 0.2f : 0.75f);
+    }
+
+    private bool CanScoutReEnter(SimUnit scout, ICombatTarget? threat)
+    {
+        if (threat is not null)
+        {
+            return false;
+        }
+
+        if (_elapsedMs - Math.Max(_aiScoutMission.LastThreatMs, _aiScoutMission.PhaseEnteredMs) < _difficultyDefinition.ScoutReentryDelayMs)
+        {
+            return false;
+        }
+
+        if (EstimateScoutSectorThreat(scout.Position) > _difficultyDefinition.ScoutThreatTolerance * 0.7f + 0.3f)
+        {
+            return false;
+        }
+
+        return scout.Position.DistanceTo(_aiScoutMission.PlannedExitPoint) <= GameConstants.TileSize * 1.75f ||
+               scout.Position.DistanceTo(_aiScoutMission.FallbackExitPoint) <= GameConstants.TileSize * 1.75f ||
+               scout.Position.DistanceTo(_aiScoutMission.BasePosition) >= scout.Sight * GameConstants.TileSize;
+    }
+
+    private Vector2 GetScoutBreakContactTarget(SimUnit scout, Vector2 fallback)
+    {
+        var best = fallback;
+        var bestScore = float.PositiveInfinity;
+        var options = new[] { _aiScoutMission.PlannedExitPoint, _aiScoutMission.FallbackExitPoint, fallback };
+        foreach (var point in options)
+        {
+            if (point == Vector2.Zero)
+            {
+                continue;
+            }
+
+            var score = scout.Position.DistanceTo(point) * 0.2f +
+                        EstimateScoutSectorThreat(point) * 24f;
+            if (_aiScoutMission.LastThreatPosition.HasValue)
+            {
+                score -= point.DistanceTo(_aiScoutMission.LastThreatPosition.Value) * 0.48f;
+            }
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = point;
+            }
+        }
+
+        return best;
+    }
+
+    private static bool ScoutReachedPoint(SimUnit scout, Vector2 point, float distance)
+    {
+        return point != Vector2.Zero && scout.Position.DistanceTo(point) <= distance;
+    }
+
+    private ICombatTarget? FindScoutThreat(SimUnit scout)
+    {
+        ICombatTarget? best = null;
+        var bestScore = float.PositiveInfinity;
+        foreach (var enemy in Units)
+        {
+            if (!enemy.Alive || enemy.Side == scout.Side || !enemy.CanAttack())
+            {
+                continue;
+            }
+
+            var distance = scout.Position.DistanceTo(enemy.Position);
+            if (distance > scout.Sight * GameConstants.TileSize + GameConstants.TileSize)
+            {
+                continue;
+            }
+
+            var threatRange = enemy.Range + scout.Radius + enemy.Radius + ScoutDangerBuffer;
+            var canThreaten = distance <= threatRange || enemy.TargetCombat == scout || enemy.Speed >= scout.Speed * 0.92f;
+            if (!canThreaten)
+            {
+                continue;
+            }
+
+            var score = distance - enemy.Speed * 0.35f;
+            if (enemy.TargetCombat == scout)
+            {
+                score -= 40f;
+            }
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = enemy;
+            }
+        }
+
+        foreach (var building in Buildings)
+        {
+            if (!building.Alive || building.Side == scout.Side || !building.CanAttack())
+            {
+                continue;
+            }
+
+            var distance = scout.Position.DistanceTo(building.Center);
+            var threatRange = building.Range + scout.Radius + ScoutDangerBuffer;
+            if (distance > scout.Sight * GameConstants.TileSize + GameConstants.TileSize ||
+                distance > threatRange + GameConstants.TileSize * 0.75f)
+            {
+                continue;
+            }
+
+            var score = distance - 24f;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = building;
+            }
+        }
+
+        return best;
     }
 
     private void CommandSquad(
@@ -2460,45 +3506,54 @@ public sealed class GameSimulation
         IssueAttackMove(unit, destination);
     }
 
-    private void BuildAiSquads(List<SimUnit> army, out List<SimUnit> mainArmy, out List<SimUnit> harassSquad)
+    private void BuildAiSquads(List<SimUnit> army, bool allowHarassSplit, out List<SimUnit> mainArmy, out List<SimUnit> harassSquad)
     {
         mainArmy = new List<SimUnit>();
         harassSquad = new List<SimUnit>();
 
-        if (Init.AiProfile != AiProfile.Harass || army.Count < 4 || !_aiMemory.LastKnownPlayerBase.HasValue)
+        if (!allowHarassSplit || army.Count < 5 || !_aiMemory.LastKnownPlayerBase.HasValue)
         {
             mainArmy.AddRange(army);
             return;
         }
 
-        var candidates = new List<SimUnit>();
+        var totalPower = 0f;
+        var totalFrontline = 0;
         foreach (var unit in army)
         {
-            if (unit.Kind == UnitKind.Catapult)
+            totalPower += CalculateUnitPower(unit);
+            if (!unit.IsRanged() && unit.Kind != UnitKind.Catapult)
             {
-                continue;
-            }
-
-            if (unit.Kind == UnitKind.Knight)
-            {
-                candidates.Insert(0, unit);
-            }
-            else
-            {
-                candidates.Add(unit);
+                totalFrontline++;
             }
         }
 
-        var pickCount = 0;
+        var desiredSize = GetDesiredHarassSquadSize(army.Count);
+        var pickedPower = 0f;
+        var pickedFrontline = 0;
+        var candidates = BuildHarassCandidates(army);
         foreach (var candidate in candidates)
         {
-            if (pickCount >= 2 || army.Count - pickCount <= 3)
+            if (harassSquad.Count >= desiredSize)
             {
                 break;
             }
 
+            var candidatePower = CalculateUnitPower(candidate);
+            var isFrontline = !candidate.IsRanged() && candidate.Kind != UnitKind.Catapult;
+            var remainingFrontline = totalFrontline - pickedFrontline - (isFrontline ? 1 : 0);
+            var remainingPower = totalPower - pickedPower - candidatePower;
+            if (remainingFrontline < 2 || remainingPower < totalPower * 0.65f)
+            {
+                continue;
+            }
+
             harassSquad.Add(candidate);
-            pickCount++;
+            pickedPower += candidatePower;
+            if (isFrontline)
+            {
+                pickedFrontline++;
+            }
         }
 
         foreach (var unit in army)
@@ -2514,6 +3569,56 @@ public sealed class GameSimulation
             mainArmy.Clear();
             mainArmy.AddRange(army);
         }
+    }
+
+    private static float CalculateUnitPower(SimUnit unit)
+    {
+        return unit.Score * (unit.Hp / (float)unit.MaxHp);
+    }
+
+    private static int GetDesiredHarassSquadSize(int armyCount)
+    {
+        return armyCount switch
+        {
+            < 5 => 0,
+            <= 7 => 2,
+            <= 10 => 3,
+            <= 14 => 4,
+            _ => 5
+        };
+    }
+
+    private static List<SimUnit> BuildHarassCandidates(List<SimUnit> army)
+    {
+        var knights = new List<SimUnit>();
+        var archers = new List<SimUnit>();
+        var footmen = new List<SimUnit>();
+        foreach (var unit in army)
+        {
+            if (unit.Kind == UnitKind.Catapult)
+            {
+                continue;
+            }
+
+            switch (unit.Kind)
+            {
+                case UnitKind.Knight:
+                    knights.Add(unit);
+                    break;
+                case UnitKind.Archer:
+                    archers.Add(unit);
+                    break;
+                case UnitKind.Footman:
+                    footmen.Add(unit);
+                    break;
+            }
+        }
+
+        var result = new List<SimUnit>(knights.Count + archers.Count + footmen.Count);
+        result.AddRange(knights);
+        result.AddRange(archers);
+        result.AddRange(footmen);
+        return result;
     }
 
     private AiSquadMetrics CalculateSquadMetrics(List<SimUnit> squad)
@@ -2738,6 +3843,788 @@ public sealed class GameSimulation
         return score;
     }
 
+    private void ResetHarassMission(bool preserveHistory)
+    {
+        var lastKind = _aiHarassMission.LastTargetKind;
+        var lastPosition = _aiHarassMission.LastTargetPosition;
+        var lastFailed = _aiHarassMission.LastRaidFailed;
+        _aiHarassMission.Reset();
+        if (preserveHistory)
+        {
+            _aiHarassMission.LastTargetKind = lastKind;
+            _aiHarassMission.LastTargetPosition = lastPosition;
+            _aiHarassMission.LastRaidFailed = lastFailed;
+        }
+    }
+
+    private void SyncHarassMissionMembers(List<SimUnit> harassSquad, List<SimUnit> aiUnits)
+    {
+        if (!_aiHarassMission.Active)
+        {
+            return;
+        }
+
+        var lostIds = new List<int>();
+        foreach (var pair in _aiHarassMission.MemberScores)
+        {
+            if (!aiUnits.Exists(unit => unit.Id == pair.Key))
+            {
+                _aiHarassMission.LossValue += pair.Value;
+                lostIds.Add(pair.Key);
+            }
+        }
+
+        foreach (var id in lostIds)
+        {
+            _aiHarassMission.MemberScores.Remove(id);
+        }
+
+        foreach (var unit in harassSquad)
+        {
+            _aiHarassMission.MemberScores[unit.Id] = unit.Score;
+        }
+    }
+
+    private void RegisterHarassTrade(SimUnit source, ICombatTarget target, int amount)
+    {
+        if (!_aiHarassMission.Active || !_aiHarassMission.MemberScores.ContainsKey(source.Id) || target.Side != GameSide.Player)
+        {
+            return;
+        }
+
+        if (target is SimUnit { Kind: UnitKind.Worker })
+        {
+            _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+        }
+        else if (target.IsBuilding && target is SimBuilding building && building.Kind != BuildingKind.TownHall)
+        {
+            _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+            var progressFactor = building.Kind == BuildingKind.Tower ? 1f : 0.75f;
+            _aiHarassMission.RaidValue += (amount / (float)building.MaxHp) * progressFactor;
+        }
+
+        if (target.Alive)
+        {
+            return;
+        }
+
+        switch (target)
+        {
+            case SimUnit { Kind: UnitKind.Worker }:
+                _aiHarassMission.WorkersKilled++;
+                _aiHarassMission.RaidValue += 1f;
+                _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+                break;
+
+            case SimBuilding building when building.Kind == BuildingKind.Tower:
+                _aiHarassMission.OuterBuildingsDestroyed++;
+                _aiHarassMission.RaidValue += 4f;
+                _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+                break;
+
+            case SimBuilding building when building.Kind != BuildingKind.TownHall:
+                _aiHarassMission.OuterBuildingsDestroyed++;
+                _aiHarassMission.RaidValue += 3f;
+                _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+                break;
+        }
+    }
+
+    private void CommandHarassSquad(
+        List<SimUnit> squad,
+        AiSquadMetrics metrics,
+        SimBuilding hall,
+        Vector2 stagePoint,
+        Vector2 suspectedBase)
+    {
+        if (squad.Count == 0)
+        {
+            ResetHarassMission(preserveHistory: true);
+            return;
+        }
+
+        SyncHarassMissionMembers(squad, Units.FindAll(unit => unit.Alive && unit.Side == GameSide.AI));
+        if (!_aiHarassMission.Active)
+        {
+            var opening = SelectHarassObjective(squad, hall, suspectedBase);
+            StartHarassMission(opening, metrics.Power, stagePoint);
+        }
+
+        if (_aiHarassMission.Phase == HarassMissionPhase.Recover && _elapsedMs >= _aiHarassMission.RecoverUntilMs)
+        {
+            var nextObjective = SelectHarassObjective(squad, hall, suspectedBase);
+            SetHarassMissionTarget(nextObjective, HarassMissionPhase.Approach);
+        }
+
+        if (_aiHarassMission.Phase is HarassMissionPhase.Approach or HarassMissionPhase.Raid)
+        {
+            RefreshHarassMissionTarget(squad, hall, suspectedBase);
+        }
+
+        var squadCenter = metrics.Center == Vector2.Zero ? squad[0].Position : metrics.Center;
+        var objectivePosition = _aiHarassMission.CurrentTargetPosition;
+        if (_aiHarassMission.Phase == HarassMissionPhase.Approach &&
+            (squadCenter.DistanceTo(objectivePosition) <= HarassRaidActivationDistance || HasVisibleHarassOpportunity(squad)))
+        {
+            SetHarassPhase(HarassMissionPhase.Raid);
+        }
+
+        if (_aiHarassMission.Phase == HarassMissionPhase.Raid)
+        {
+            if (ShouldDisengageHarass(squad, metrics, hall, suspectedBase))
+            {
+                BeginHarassDisengage(stagePoint);
+            }
+            else if (IsCurrentHarassTargetExhausted(squad, objectivePosition))
+            {
+                var nextObjective = SelectHarassObjective(squad, hall, suspectedBase);
+                if (nextObjective.Kind == HarassTargetKind.ApproachPoint &&
+                    nextObjective.Position.DistanceTo(objectivePosition) <= GameConstants.TileSize * 2f)
+                {
+                    BeginHarassDisengage(stagePoint);
+                }
+                else
+                {
+                    SetHarassMissionTarget(nextObjective, HarassMissionPhase.Approach);
+                }
+            }
+        }
+
+        if (_aiHarassMission.Phase == HarassMissionPhase.Disengage &&
+            squadCenter.DistanceTo(_aiHarassMission.RecoverPoint) <= GameConstants.TileSize * 2.2f)
+        {
+            SetHarassPhase(HarassMissionPhase.Recover);
+            _aiHarassMission.RecoverUntilMs = _elapsedMs + HarassRecoverDurationMs;
+        }
+
+        switch (_aiHarassMission.Phase)
+        {
+            case HarassMissionPhase.Approach:
+                CommandHarassFormation(squad, _aiHarassMission.CurrentTargetPosition, suspectedBase, 18f, 34f);
+                break;
+
+            case HarassMissionPhase.Raid:
+                CommandHarassFormation(squad, _aiHarassMission.CurrentTargetPosition, suspectedBase, 8f, 24f);
+                break;
+
+            case HarassMissionPhase.Disengage:
+            case HarassMissionPhase.Recover:
+                CommandHarassRetreat(squad, _aiHarassMission.RecoverPoint, hall.Center);
+                break;
+        }
+    }
+
+    private void StartHarassMission(HarassObjective objective, float startPower, Vector2 recoverPoint)
+    {
+        _aiHarassMission.Reset();
+        _aiHarassMission.Active = true;
+        _aiHarassMission.StartPower = float.Max(startPower, 0.01f);
+        _aiHarassMission.RecoverPoint = recoverPoint;
+        _aiHarassMission.LastPositiveTradeMs = _elapsedMs;
+        SetHarassMissionTarget(objective, HarassMissionPhase.Approach);
+    }
+
+    private void SetHarassMissionTarget(HarassObjective objective, HarassMissionPhase phase)
+    {
+        _aiHarassMission.CurrentTargetKind = objective.Kind;
+        _aiHarassMission.CurrentTargetPosition = objective.Position;
+        _aiHarassMission.CurrentTargetEntityId = objective.EntityId;
+        _aiHarassMission.CurrentTargetScore = objective.Score;
+        _aiHarassMission.LastTargetKind = objective.Kind;
+        _aiHarassMission.LastTargetPosition = objective.Position;
+        SetHarassPhase(phase);
+    }
+
+    private void SetHarassPhase(HarassMissionPhase phase)
+    {
+        _aiHarassMission.Phase = phase;
+        _aiHarassMission.PhaseEnteredMs = _elapsedMs;
+    }
+
+    private void BeginHarassDisengage(Vector2 recoverPoint)
+    {
+        _aiHarassMission.LastRaidFailed = !IsSuccessfulHarassRaid();
+        _aiHarassMission.RecoverPoint = recoverPoint;
+        SetHarassPhase(HarassMissionPhase.Disengage);
+    }
+
+    private bool IsSuccessfulHarassRaid()
+    {
+        return _aiHarassMission.WorkersKilled >= 2 ||
+               _aiHarassMission.OuterBuildingsDestroyed > 0 ||
+               _aiHarassMission.RaidValue >= 3f;
+    }
+
+    private void RefreshHarassMissionTarget(List<SimUnit> squad, SimBuilding hall, Vector2 suspectedBase)
+    {
+        var nextObjective = SelectHarassObjective(squad, hall, suspectedBase);
+        var currentStillUseful = IsCurrentHarassObjectiveRelevant(squad);
+        if (!currentStillUseful || nextObjective.Score + 28f < _aiHarassMission.CurrentTargetScore)
+        {
+            SetHarassMissionTarget(nextObjective, _aiHarassMission.Phase == HarassMissionPhase.Raid ? HarassMissionPhase.Raid : HarassMissionPhase.Approach);
+        }
+    }
+
+    private bool IsCurrentHarassObjectiveRelevant(List<SimUnit> squad)
+    {
+        if (!_aiHarassMission.Active)
+        {
+            return false;
+        }
+
+        switch (_aiHarassMission.CurrentTargetKind)
+        {
+            case HarassTargetKind.WorkerLine:
+                if (_aiHarassMission.CurrentTargetEntityId.HasValue &&
+                    TryGetPlayerUnit(_aiHarassMission.CurrentTargetEntityId.Value, out var worker) &&
+                    worker.Kind == UnitKind.Worker)
+                {
+                    return true;
+                }
+
+                return CountKnownWorkersNear(_aiHarassMission.CurrentTargetPosition, GameConstants.TileSize * 3f) > 0;
+
+            case HarassTargetKind.OuterBuilding:
+            case HarassTargetKind.FallbackBuilding:
+                return _aiHarassMission.CurrentTargetEntityId.HasValue &&
+                       TryGetPlayerBuilding(_aiHarassMission.CurrentTargetEntityId.Value, out _);
+
+            case HarassTargetKind.GoldMine:
+            case HarassTargetKind.ApproachPoint:
+                return true;
+
+            default:
+                return HasVisibleHarassOpportunity(squad);
+        }
+    }
+
+    private bool ShouldDisengageHarass(List<SimUnit> squad, AiSquadMetrics metrics, SimBuilding hall, Vector2 suspectedBase)
+    {
+        if (metrics.Count == 0)
+        {
+            return true;
+        }
+
+        var localEnemyPower = EstimateVisibleEnemyPowerAround(squad, metrics.Center == Vector2.Zero ? _aiHarassMission.CurrentTargetPosition : metrics.Center, HarassThreatRadius);
+        var currentPower = metrics.Power;
+        var losing = currentPower < _aiHarassMission.StartPower * 0.7f ||
+                     localEnemyPower >= currentPower * 1.15f ||
+                     (_aiHarassMission.LossValue > 0f && _elapsedMs - _aiHarassMission.LastPositiveTradeMs > HarassNoTradeWindowMs);
+        if (!losing)
+        {
+            return false;
+        }
+
+        if (IsSuccessfulHarassRaid())
+        {
+            return true;
+        }
+
+        return currentPower < _aiHarassMission.StartPower * 0.55f ||
+               localEnemyPower >= currentPower * 1.35f ||
+               metrics.Center.DistanceTo(hall.Center) < hall.Center.DistanceTo(suspectedBase) * 0.45f;
+    }
+
+    private bool HasVisibleHarassOpportunity(List<SimUnit> squad)
+    {
+        foreach (var unit in Units)
+        {
+            if (!unit.Alive || unit.Side != GameSide.Player)
+            {
+                continue;
+            }
+
+            if (!IsVisibleToSquad(squad, unit.Position, unit.Radius))
+            {
+                continue;
+            }
+
+            if (unit.Kind == UnitKind.Worker || unit.CanAttack())
+            {
+                return true;
+            }
+        }
+
+        foreach (var building in Buildings)
+        {
+            if (!building.Alive || building.Side != GameSide.Player || building.Kind == BuildingKind.TownHall)
+            {
+                continue;
+            }
+
+            if (IsVisibleToSquad(squad, building.Center, building.Radius))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsCurrentHarassTargetExhausted(List<SimUnit> squad, Vector2 objectivePosition)
+    {
+        return !HasVisibleHarassOpportunity(squad) &&
+               CountKnownWorkersNear(objectivePosition, GameConstants.TileSize * 3f) == 0 &&
+               !HasKnownOuterTargetNear(objectivePosition, GameConstants.TileSize * 4f);
+    }
+
+    private HarassObjective SelectHarassObjective(List<SimUnit> squad, SimBuilding hall, Vector2 suspectedBase)
+    {
+        var squadCenter = CalculateSquadMetrics(squad).Center;
+        if (squadCenter == Vector2.Zero)
+        {
+            squadCenter = squad[0].Position;
+        }
+
+        var basePosition = _aiMemory.LastKnownPlayerBase ?? suspectedBase;
+        var baseTile = _aiMemory.LastKnownPlayerBaseTile ?? Map.WorldToTile(basePosition);
+        HarassObjective? best = null;
+
+        void Consider(HarassTargetKind kind, Vector2 position, int? entityId, float score)
+        {
+            if (best is null || score < best.Value.Score)
+            {
+                best = new HarassObjective(kind, position, entityId, score);
+            }
+        }
+
+        foreach (var unit in Units)
+        {
+            if (!unit.Alive || unit.Side != GameSide.Player || unit.Kind != UnitKind.Worker || !IsVisibleToSquad(squad, unit.Position, unit.Radius))
+            {
+                continue;
+            }
+
+            var cluster = CountVisibleWorkersNear(unit.Position, GameConstants.TileSize * 2.4f);
+            var score = -220f - cluster * 32f + squadCenter.DistanceTo(unit.Position) * 0.42f + EstimateKnownThreatAt(unit.Position, HarassThreatRadius) * 18f;
+            Consider(HarassTargetKind.WorkerLine, unit.Position, unit.Id, ApplyHarassRepeatPenalty(kind: HarassTargetKind.WorkerLine, position: unit.Position, score));
+        }
+
+        foreach (var remembered in _aiMemory.Units.Values)
+        {
+            if (!IsFreshEnemyMemory(remembered.LastSeenMs) || remembered.Kind != UnitKind.Worker)
+            {
+                continue;
+            }
+
+            var mineDistance = DistanceToNearestPlayerMine(remembered.Position);
+            if (mineDistance > GameConstants.TileSize * 7f)
+            {
+                continue;
+            }
+
+            var workerSupport = CountKnownWorkersNear(remembered.Position, GameConstants.TileSize * 2.8f);
+            var score = -150f - workerSupport * 24f + squadCenter.DistanceTo(remembered.Position) * 0.5f + EstimateKnownThreatAt(remembered.Position, HarassThreatRadius) * 20f;
+            Consider(HarassTargetKind.WorkerLine, remembered.Position, remembered.Id, ApplyHarassRepeatPenalty(HarassTargetKind.WorkerLine, remembered.Position, score));
+        }
+
+        foreach (var resource in Resources)
+        {
+            if (!resource.Alive || basePosition.DistanceTo(resource.Center) > GameConstants.TileSize * 10f)
+            {
+                continue;
+            }
+
+            if (!TryFindWalkableRaidPoint(Map.WorldToTile(resource.Center), 2, 5, squadCenter, out var raidPoint))
+            {
+                continue;
+            }
+
+            var workerPressure = CountKnownWorkersNear(resource.Center, GameConstants.TileSize * 3.2f);
+            var score = (resource.Type == ResourceType.Gold ? -92f : -46f) - workerPressure * 18f + squadCenter.DistanceTo(raidPoint) * 0.48f + EstimateKnownThreatAt(raidPoint, HarassThreatRadius) * 20f;
+            Consider(HarassTargetKind.GoldMine, raidPoint, resource.Id, ApplyHarassRepeatPenalty(HarassTargetKind.GoldMine, raidPoint, score));
+        }
+
+        foreach (var building in _aiMemory.Buildings.Values)
+        {
+            if (!IsFreshEnemyMemory(building.LastSeenMs) || building.Kind == BuildingKind.TownHall)
+            {
+                continue;
+            }
+
+            if (!TryFindWalkableRaidPoint(building.CenterTile, 3, 6, squadCenter, out var raidPoint))
+            {
+                continue;
+            }
+
+            var score = squadCenter.DistanceTo(raidPoint) * 0.46f + EstimateKnownThreatAt(raidPoint, HarassThreatRadius) * 21f;
+            score -= building.Kind switch
+            {
+                BuildingKind.Tower => 88f,
+                BuildingKind.Workshop => 54f,
+                BuildingKind.Barracks => 48f,
+                BuildingKind.Farm => 28f,
+                _ => 18f
+            };
+            Consider(HarassTargetKind.OuterBuilding, raidPoint, building.Id, ApplyHarassRepeatPenalty(HarassTargetKind.OuterBuilding, raidPoint, score));
+        }
+
+        foreach (var point in GenerateHarassApproachPoints(baseTile, squadCenter))
+        {
+            var score = 54f + squadCenter.DistanceTo(point) * 0.38f + EstimateKnownThreatAt(point, HarassThreatRadius) * 16f + point.DistanceTo(basePosition) * 0.12f;
+            Consider(HarassTargetKind.ApproachPoint, point, null, ApplyHarassRepeatPenalty(HarassTargetKind.ApproachPoint, point, score));
+        }
+
+        foreach (var building in _aiMemory.Buildings.Values)
+        {
+            if (!IsFreshEnemyMemory(building.LastSeenMs) || building.Kind != BuildingKind.TownHall)
+            {
+                continue;
+            }
+
+            if (!TryFindWalkableRaidPoint(building.CenterTile, 3, 7, squadCenter, out var raidPoint))
+            {
+                continue;
+            }
+
+            var score = 220f + squadCenter.DistanceTo(raidPoint) * 0.42f + EstimateKnownThreatAt(raidPoint, HarassThreatRadius) * 24f;
+            Consider(HarassTargetKind.FallbackBuilding, raidPoint, building.Id, ApplyHarassRepeatPenalty(HarassTargetKind.FallbackBuilding, raidPoint, score));
+        }
+
+        if (best.HasValue)
+        {
+            return best.Value;
+        }
+
+        return new HarassObjective(HarassTargetKind.ApproachPoint, FindAssaultApproachPoint(basePosition, hall.Center), null, 999f);
+    }
+
+    private float ApplyHarassRepeatPenalty(HarassTargetKind kind, Vector2 position, float score)
+    {
+        if (_aiHarassMission.LastTargetPosition.HasValue &&
+            _aiHarassMission.LastRaidFailed &&
+            _aiHarassMission.LastTargetPosition.Value.DistanceTo(position) <= HarassRepeatPenaltyDistance)
+        {
+            score += 140f;
+        }
+
+        if (_aiHarassMission.LastTargetKind.HasValue &&
+            _aiHarassMission.LastRaidFailed &&
+            _aiHarassMission.LastTargetKind.Value == kind)
+        {
+            score += 36f;
+        }
+
+        return score;
+    }
+
+    private int CountVisibleWorkersNear(Vector2 position, float radius)
+    {
+        var count = 0;
+        foreach (var unit in Units)
+        {
+            if (unit.Alive && unit.Side == GameSide.Player && unit.Kind == UnitKind.Worker && unit.Position.DistanceTo(position) <= radius)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private int CountKnownWorkersNear(Vector2 position, float radius)
+    {
+        var count = 0;
+        foreach (var unit in _aiMemory.Units.Values)
+        {
+            if (IsFreshEnemyMemory(unit.LastSeenMs) && unit.Kind == UnitKind.Worker && unit.Position.DistanceTo(position) <= radius)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private int CountKnownCombatUnitsNear(Vector2 position, float radius)
+    {
+        var count = 0;
+        foreach (var unit in _aiMemory.Units.Values)
+        {
+            if (IsFreshEnemyMemory(unit.LastSeenMs) &&
+                unit.Kind != UnitKind.Worker &&
+                unit.Position.DistanceTo(position) <= radius)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private bool HasKnownTowerNear(Vector2 position, float radius)
+    {
+        foreach (var building in _aiMemory.Buildings.Values)
+        {
+            if (!IsFreshEnemyMemory(building.LastSeenMs) ||
+                building.Kind != BuildingKind.Tower)
+            {
+                continue;
+            }
+
+            if (building.Position.DistanceTo(position) <= radius)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool HasKnownOuterTargetNear(Vector2 position, float radius)
+    {
+        foreach (var building in _aiMemory.Buildings.Values)
+        {
+            if (!IsFreshEnemyMemory(building.LastSeenMs) || building.Kind == BuildingKind.TownHall)
+            {
+                continue;
+            }
+
+            if (building.Position.DistanceTo(position) <= radius)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private float DistanceToNearestPlayerMine(Vector2 position)
+    {
+        var best = float.PositiveInfinity;
+        foreach (var resource in Resources)
+        {
+            if (!resource.Alive || resource.Type != ResourceType.Gold)
+            {
+                continue;
+            }
+
+            var distance = resource.Center.DistanceTo(position);
+            if (distance < best)
+            {
+                best = distance;
+            }
+        }
+
+        return best;
+    }
+
+    private float EstimateKnownThreatAt(Vector2 position, float radius)
+    {
+        var threat = 0f;
+        foreach (var unit in _aiMemory.Units.Values)
+        {
+            if (IsFreshEnemyMemory(unit.LastSeenMs) && unit.Position.DistanceTo(position) <= radius)
+            {
+                threat += unit.Power;
+            }
+        }
+
+        foreach (var building in _aiMemory.Buildings.Values)
+        {
+            if (!IsFreshEnemyMemory(building.LastSeenMs))
+            {
+                continue;
+            }
+
+            if (building.Kind == BuildingKind.Tower && building.Position.DistanceTo(position) <= radius + GameConstants.TileSize * 2f)
+            {
+                threat += 2.8f;
+            }
+        }
+
+        return threat;
+    }
+
+    private float EstimateVisibleEnemyPowerAround(List<SimUnit> squad, Vector2 position, float radius)
+    {
+        var power = 0f;
+        foreach (var unit in Units)
+        {
+            if (!unit.Alive || unit.Side != GameSide.Player || !IsVisibleToSquad(squad, unit.Position, unit.Radius))
+            {
+                continue;
+            }
+
+            if (unit.Position.DistanceTo(position) <= radius)
+            {
+                power += CalculateUnitPower(unit);
+            }
+        }
+
+        foreach (var building in Buildings)
+        {
+            if (!building.Alive || building.Side != GameSide.Player || !IsVisibleToSquad(squad, building.Center, building.Radius))
+            {
+                continue;
+            }
+
+            if (building.Kind == BuildingKind.Tower && building.Center.DistanceTo(position) <= radius + GameConstants.TileSize * 2f)
+            {
+                power += 2.8f;
+            }
+        }
+
+        return power;
+    }
+
+    private bool IsVisibleToSquad(List<SimUnit> squad, Vector2 position, float padding)
+    {
+        foreach (var unit in squad)
+        {
+            if (!unit.Alive)
+            {
+                continue;
+            }
+
+            if (unit.Position.DistanceTo(position) <= unit.Sight * GameConstants.TileSize + padding)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindWalkableRaidPoint(Vector2I centerTile, int minRadius, int maxRadius, Vector2 reference, out Vector2 point)
+    {
+        point = Vector2.Zero;
+        var bestScore = float.PositiveInfinity;
+        var found = false;
+        for (var radius = minRadius; radius <= maxRadius; radius++)
+        {
+            for (var dy = -radius; dy <= radius; dy++)
+            {
+                for (var dx = -radius; dx <= radius; dx++)
+                {
+                    if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
+                    {
+                        continue;
+                    }
+
+                    var tx = centerTile.X + dx;
+                    var ty = centerTile.Y + dy;
+                    if (!Map.IsWalkable(tx, ty))
+                    {
+                        continue;
+                    }
+
+                    var world = Map.TileToWorldCenter(tx, ty);
+                    var score = world.DistanceTo(reference) + EstimateKnownThreatAt(world, GameConstants.TileSize * 4f) * 18f;
+                    if (_aiHarassMission.LastTargetPosition.HasValue &&
+                        _aiHarassMission.LastRaidFailed &&
+                        _aiHarassMission.LastTargetPosition.Value.DistanceTo(world) <= HarassRepeatPenaltyDistance)
+                    {
+                        score += 120f;
+                    }
+
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        point = world;
+                        found = true;
+                    }
+                }
+            }
+        }
+
+        return found;
+    }
+
+    private List<Vector2> GenerateHarassApproachPoints(Vector2I baseTile, Vector2 reference)
+    {
+        var result = new List<Vector2>();
+        var offsets = new[]
+        {
+            new Vector2I(0, 6),
+            new Vector2I(6, 0),
+            new Vector2I(4, 4),
+            new Vector2I(-4, 4),
+            new Vector2I(0, -6),
+            new Vector2I(6, -3),
+            new Vector2I(-6, 3)
+        };
+
+        foreach (var offset in offsets)
+        {
+            var candidateTile = baseTile + offset;
+            if (TryFindWalkableRaidPoint(candidateTile, 0, 2, reference, out var point))
+            {
+                result.Add(point);
+            }
+        }
+
+        if (result.Count == 0 && TryFindWalkableRaidPoint(baseTile, 5, 8, reference, out var fallback))
+        {
+            result.Add(fallback);
+        }
+
+        return result;
+    }
+
+    private bool TryGetPlayerUnit(int id, out SimUnit unit)
+    {
+        unit = null!;
+        foreach (var candidate in Units)
+        {
+            if (candidate.Alive && candidate.Side == GameSide.Player && candidate.Id == id)
+            {
+                unit = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryGetPlayerBuilding(int id, out SimBuilding building)
+    {
+        building = null!;
+        foreach (var candidate in Buildings)
+        {
+            if (candidate.Alive && candidate.Side == GameSide.Player && candidate.Id == id)
+            {
+                building = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void CommandHarassFormation(List<SimUnit> squad, Vector2 anchor, Vector2 lookTarget, float frontlineOffset, float backlineOffset)
+    {
+        var facing = lookTarget - anchor;
+        if (facing.LengthSquared() <= 0.01f)
+        {
+            facing = Vector2.Right;
+        }
+
+        facing = facing.Normalized();
+        var side = new Vector2(-facing.Y, facing.X);
+        var frontline = new List<SimUnit>();
+        var backline = new List<SimUnit>();
+        foreach (var unit in squad)
+        {
+            if (unit.IsRanged())
+            {
+                backline.Add(unit);
+            }
+            else
+            {
+                frontline.Add(unit);
+            }
+        }
+
+        CommandFormationRow(frontline, anchor + facing * frontlineOffset, side, false, false);
+        CommandFormationRow(backline, anchor - facing * backlineOffset, side, false, false);
+    }
+
+    private void CommandHarassRetreat(List<SimUnit> squad, Vector2 recoverPoint, Vector2 lookTarget)
+    {
+        CommandHarassFormation(squad, recoverPoint, lookTarget, 10f, 20f);
+    }
+
     private void ApplyAiMicro(
         List<SimUnit> mainArmy,
         AiSquadMetrics mainMetrics,
@@ -2747,7 +4634,14 @@ public sealed class GameSimulation
         bool pressure)
     {
         ApplyAiMicroToSquad(mainArmy, mainMetrics, false, hall.Center);
-        ApplyAiMicroToSquad(harassSquad, harassMetrics, _aiState == AiState.Harass, hall.Center);
+        if (_aiState == AiState.Harass)
+        {
+            ApplyHarassMicro(harassSquad, harassMetrics, hall.Center);
+        }
+        else
+        {
+            ApplyAiMicroToSquad(harassSquad, harassMetrics, false, hall.Center);
+        }
         if (pressure && mainArmy.Count == 0)
         {
             foreach (var worker in Units)
@@ -2765,10 +4659,50 @@ public sealed class GameSimulation
         }
     }
 
+    private void ApplyHarassMicro(List<SimUnit> squad, AiSquadMetrics metrics, Vector2 fallback)
+    {
+        if (squad.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var unit in squad)
+        {
+            ICombatTarget? target = _aiHarassMission.Phase is HarassMissionPhase.Disengage or HarassMissionPhase.Recover
+                ? FindHarassRetreatThreat(unit)
+                : FindPreferredHarassEnemy(unit);
+            if (target is not null && (unit.State != UnitState.Attack || unit.TargetCombat != target))
+            {
+                IssueAttack(unit, target);
+            }
+
+            if (target is null)
+            {
+                continue;
+            }
+
+            var enemyDistance = unit.Position.DistanceTo(target.Position);
+            var frontlineNearby = CountAiFrontlineNear(unit.Position, squad, 64f);
+            if (unit.Kind == UnitKind.Archer && enemyDistance < 74f && frontlineNearby == 0)
+            {
+                var retreatAnchor = _aiHarassMission.Phase is HarassMissionPhase.Disengage or HarassMissionPhase.Recover
+                    ? _aiHarassMission.RecoverPoint
+                    : (metrics.Center == Vector2.Zero ? fallback : metrics.Center);
+                var retreat = retreatAnchor - (target.Position - retreatAnchor).Normalized() * 42f;
+                CommandUnitMove(unit, retreat);
+            }
+        }
+    }
+
     private void ApplyAiMicroToSquad(List<SimUnit> squad, AiSquadMetrics metrics, bool preferWorkers, Vector2 fallback)
     {
         foreach (var unit in squad)
         {
+            if (unit.IsNonCombatScout)
+            {
+                continue;
+            }
+
             var target = FindPreferredVisibleEnemy(unit, preferWorkers);
             if (target is not null && (unit.State != UnitState.Attack || unit.TargetCombat != target))
             {
@@ -2796,6 +4730,168 @@ public sealed class GameSimulation
                 CommandUnitMove(unit, retreat);
             }
         }
+    }
+
+    private ICombatTarget? FindPreferredHarassEnemy(SimUnit unit)
+    {
+        var sensorRange = unit.Sight * GameConstants.TileSize;
+        var visibleWorkers = false;
+        var visibleCombat = false;
+        var visibleOuterBuildings = false;
+        foreach (var other in Units)
+        {
+            if (!other.Alive || other.Side == unit.Side)
+            {
+                continue;
+            }
+
+            var distance = unit.Position.DistanceTo(other.Position);
+            if (distance > sensorRange)
+            {
+                continue;
+            }
+
+            if (other.Kind == UnitKind.Worker)
+            {
+                visibleWorkers = true;
+            }
+            else if (other.CanAttack())
+            {
+                visibleCombat = true;
+            }
+        }
+
+        foreach (var building in Buildings)
+        {
+            if (!building.Alive || building.Side == unit.Side)
+            {
+                continue;
+            }
+
+            var distance = unit.Position.DistanceTo(building.Center);
+            if (distance > sensorRange + building.Radius)
+            {
+                continue;
+            }
+
+            if (building.Kind != BuildingKind.TownHall)
+            {
+                visibleOuterBuildings = true;
+            }
+        }
+
+        SimUnit? bestUnit = null;
+        var bestUnitScore = float.PositiveInfinity;
+        foreach (var other in Units)
+        {
+            if (!other.Alive || other.Side == unit.Side)
+            {
+                continue;
+            }
+
+            var distance = unit.Position.DistanceTo(other.Position);
+            if (distance > sensorRange)
+            {
+                continue;
+            }
+
+            var score = distance;
+            if (other.Kind == UnitKind.Worker)
+            {
+                score -= 165f;
+            }
+            else if (other.CanAttack())
+            {
+                score -= distance <= unit.Range + other.Radius + unit.Radius + 26f ? 120f : 72f;
+            }
+
+            if (score < bestUnitScore)
+            {
+                bestUnitScore = score;
+                bestUnit = other;
+            }
+        }
+
+        if (bestUnit is not null)
+        {
+            return bestUnit;
+        }
+
+        SimBuilding? bestBuilding = null;
+        var bestBuildingScore = float.PositiveInfinity;
+        foreach (var building in Buildings)
+        {
+            if (!building.Alive || building.Side == unit.Side)
+            {
+                continue;
+            }
+
+            var distance = unit.Position.DistanceTo(building.Center);
+            if (distance > sensorRange + building.Radius)
+            {
+                continue;
+            }
+
+            var score = distance;
+            if (building.Kind == BuildingKind.TownHall && (visibleWorkers || visibleCombat || visibleOuterBuildings))
+            {
+                score += 240f;
+            }
+            else
+            {
+                score -= building.Kind switch
+                {
+                    BuildingKind.Tower => 96f,
+                    BuildingKind.Workshop => 62f,
+                    BuildingKind.Barracks => 56f,
+                    BuildingKind.Farm => 34f,
+                    BuildingKind.TownHall => -12f,
+                    _ => 18f
+                };
+            }
+
+            if (score < bestBuildingScore)
+            {
+                bestBuildingScore = score;
+                bestBuilding = building;
+            }
+        }
+
+        return bestBuilding;
+    }
+
+    private ICombatTarget? FindHarassRetreatThreat(SimUnit unit)
+    {
+        SimUnit? bestThreat = null;
+        var bestScore = float.PositiveInfinity;
+        var sensorRange = unit.Sight * GameConstants.TileSize;
+        foreach (var other in Units)
+        {
+            if (!other.Alive || other.Side == unit.Side || !other.CanAttack())
+            {
+                continue;
+            }
+
+            var distance = unit.Position.DistanceTo(other.Position);
+            if (distance > sensorRange)
+            {
+                continue;
+            }
+
+            var score = distance;
+            if (other.TargetCombat == unit)
+            {
+                score -= 48f;
+            }
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestThreat = other;
+            }
+        }
+
+        return bestThreat;
     }
 
     private int CountAiFrontlineNear(Vector2 position, List<SimUnit> squad, float radius)
@@ -2909,6 +5005,41 @@ public sealed class GameSimulation
         Finish
     }
 
+    private enum HarassMissionPhase
+    {
+        Approach,
+        Raid,
+        Disengage,
+        Recover
+    }
+
+    private enum HarassTargetKind
+    {
+        WorkerLine,
+        GoldMine,
+        OuterBuilding,
+        ApproachPoint,
+        FallbackBuilding
+    }
+
+    private enum ScoutMissionPhase
+    {
+        ApproachEdge,
+        Peek,
+        BreakContact,
+        Reposition,
+        ReEnter
+    }
+
+    private enum ScoutIntelTargetKind
+    {
+        BaseEdge,
+        WorkerLine,
+        OuterBuilding,
+        TowerPerimeter,
+        ArmyEdge
+    }
+
     private sealed class AiMemory
     {
         public Dictionary<int, AiKnownUnit> Units { get; } = [];
@@ -2918,7 +5049,110 @@ public sealed class GameSimulation
         public double LastContactMs { get; set; } = -99999d;
     }
 
+    private sealed class HarassMissionState
+    {
+        public bool Active { get; set; }
+        public HarassMissionPhase Phase { get; set; } = HarassMissionPhase.Approach;
+        public HarassTargetKind CurrentTargetKind { get; set; } = HarassTargetKind.ApproachPoint;
+        public Vector2 CurrentTargetPosition { get; set; }
+        public int? CurrentTargetEntityId { get; set; }
+        public float CurrentTargetScore { get; set; } = float.PositiveInfinity;
+        public float StartPower { get; set; }
+        public float RaidValue { get; set; }
+        public float LossValue { get; set; }
+        public int WorkersKilled { get; set; }
+        public int OuterBuildingsDestroyed { get; set; }
+        public double PhaseEnteredMs { get; set; }
+        public double LastPositiveTradeMs { get; set; } = -99999d;
+        public double RecoverUntilMs { get; set; }
+        public Vector2 RecoverPoint { get; set; }
+        public HarassTargetKind? LastTargetKind { get; set; }
+        public Vector2? LastTargetPosition { get; set; }
+        public bool LastRaidFailed { get; set; }
+        public Dictionary<int, int> MemberScores { get; } = [];
+
+        public void Reset()
+        {
+            Active = false;
+            Phase = HarassMissionPhase.Approach;
+            CurrentTargetKind = HarassTargetKind.ApproachPoint;
+            CurrentTargetPosition = Vector2.Zero;
+            CurrentTargetEntityId = null;
+            CurrentTargetScore = float.PositiveInfinity;
+            StartPower = 0f;
+            RaidValue = 0f;
+            LossValue = 0f;
+            WorkersKilled = 0;
+            OuterBuildingsDestroyed = 0;
+            PhaseEnteredMs = 0d;
+            LastPositiveTradeMs = -99999d;
+            RecoverUntilMs = 0d;
+            RecoverPoint = Vector2.Zero;
+            LastTargetKind = null;
+            LastTargetPosition = null;
+            LastRaidFailed = false;
+            MemberScores.Clear();
+        }
+    }
+
+    private sealed class ScoutMissionState
+    {
+        public bool Active { get; set; }
+        public int? ScoutUnitId { get; set; }
+        public bool WorkerFallback { get; set; }
+        public ScoutMissionPhase Phase { get; set; } = ScoutMissionPhase.ApproachEdge;
+        public double PhaseEnteredMs { get; set; }
+        public double LastThreatMs { get; set; } = -99999d;
+        public double ConfirmedBaseMs { get; set; } = -99999d;
+        public double ExposureStartedMs { get; set; } = -99999d;
+        public Vector2 BasePosition { get; set; }
+        public Vector2I? BaseTile { get; set; }
+        public Vector2 RecoverPoint { get; set; }
+        public Vector2? LastThreatPosition { get; set; }
+        public int CurrentSector { get; set; } = -1;
+        public int LastSector { get; set; } = -1;
+        public Vector2 EntryPoint { get; set; }
+        public Vector2 PeekPoint { get; set; }
+        public Vector2 PlannedExitPoint { get; set; }
+        public Vector2 FallbackExitPoint { get; set; }
+        public ScoutIntelTargetKind LastIntelTargetKind { get; set; } = ScoutIntelTargetKind.BaseEdge;
+
+        public void Reset()
+        {
+            Active = false;
+            ScoutUnitId = null;
+            WorkerFallback = false;
+            Phase = ScoutMissionPhase.ApproachEdge;
+            PhaseEnteredMs = 0d;
+            LastThreatMs = -99999d;
+            ConfirmedBaseMs = -99999d;
+            ExposureStartedMs = -99999d;
+            BasePosition = Vector2.Zero;
+            BaseTile = null;
+            RecoverPoint = Vector2.Zero;
+            LastThreatPosition = null;
+            CurrentSector = -1;
+            LastSector = -1;
+            EntryPoint = Vector2.Zero;
+            PeekPoint = Vector2.Zero;
+            PlannedExitPoint = Vector2.Zero;
+            FallbackExitPoint = Vector2.Zero;
+            LastIntelTargetKind = ScoutIntelTargetKind.BaseEdge;
+        }
+    }
+
     private sealed record AiKnownUnit(int Id, UnitKind Kind, Vector2 Position, float Power, double LastSeenMs);
     private sealed record AiKnownBuilding(int Id, BuildingKind Kind, Vector2 Position, Vector2I CenterTile, int MaxHp, double LastSeenMs);
+    private readonly record struct HarassObjective(HarassTargetKind Kind, Vector2 Position, int? EntityId, float Score);
+    private readonly record struct ScoutSectorAnchor(int SectorIndex, Vector2 EntryPoint, Vector2 PeekPoint);
+    private readonly record struct ScoutSectorOption(
+        int SectorIndex,
+        Vector2 EntryPoint,
+        Vector2 PeekPoint,
+        Vector2 ExitPoint,
+        Vector2 FallbackExitPoint,
+        ScoutIntelTargetKind IntelKind,
+        float Score);
+    private readonly record struct ScoutIntelInfo(ScoutIntelTargetKind Kind, float Score);
     private readonly record struct AiSquadMetrics(Vector2 Center, float Power, float SlowestSpeed, int FrontlineCount, int BacklineCount, int SiegeCount, int Count);
 }

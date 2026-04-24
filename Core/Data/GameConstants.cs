@@ -29,9 +29,15 @@ public static class GameConstants
     public const float SelectionDragThreshold = 12f;
     public const float GroupSpacing = 34f;
     public const float RepathIntervalMs = 500f;
-    public const float StuckRepathDelayMs = 1000f;
+    public const float StuckRepathDelayMs = 500f;
     public const float StuckMovedEpsilon = 0.2f;
+    public const float PathProgressImprovementEpsilon = 4f;
     public const float LocalAvoidanceStep = 8f;
+    public const float WorkerFlowLaneOffset = 10f;
+    public const float DeadlockResolveTriggerMs = 140f;
+    public const float DeadlockResolveMinOverlap = 2.5f;
+    public const float DeadlockYieldMinStep = 3.5f;
+    public const float DeadlockYieldMaxStep = 6f;
     public const float WorkerSafeCombatHallRadiusMultiplier = 1.5f;
     public const float WorkerCombatLeashHallRadiusMultiplier = 3.0f;
     public const float WorkerThreatQuietWindowMs = 850f;

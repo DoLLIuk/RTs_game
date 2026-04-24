@@ -20,6 +20,10 @@ public sealed record DifficultyDefinition(
     int AiDelayMs,
     int TargetWorkers,
     int ScoutDelayMs,
+    int ScoutMaxExposureMs,
+    int ScoutReentryDelayMs,
+    float ScoutSectorRepeatPenalty,
+    float ScoutThreatTolerance,
     int PushMinPower,
     int HarassMinPower,
     float AttackAdvantageRatio,
@@ -40,9 +44,9 @@ public static class GameSettings
 {
     public static readonly IReadOnlyDictionary<Difficulty, DifficultyDefinition> Difficulties = new Dictionary<Difficulty, DifficultyDefinition>
     {
-        [Difficulty.Easy] = new("Easy", 1200, 7, 7000, 9, 7, 1.32f, 0.72f, 5200, 11),
-        [Difficulty.Normal] = new("Normal", 750, 10, 4200, 11, 8, 1.08f, 0.58f, 4000, 12),
-        [Difficulty.Hard] = new("Hard", 520, 13, 2500, 12, 9, 0.92f, 0.46f, 3000, 13)
+        [Difficulty.Easy] = new("Easy", 1200, 7, 7000, 1350, 1650, 120f, 0.2f, 9, 7, 1.32f, 0.72f, 5200, 11),
+        [Difficulty.Normal] = new("Normal", 750, 10, 4200, 900, 900, 72f, 0.8f, 11, 8, 1.08f, 0.58f, 4000, 12),
+        [Difficulty.Hard] = new("Hard", 520, 13, 2500, 650, 550, 42f, 1.35f, 12, 9, 0.92f, 0.46f, 3000, 13)
     };
 
     public static DifficultyDefinition GetDifficulty(Difficulty difficulty)

@@ -43,11 +43,11 @@
 
 Текущие профили:
 
-| Difficulty | AiDelayMs | TargetWorkers | ScoutDelayMs | PushMinPower | HarassMinPower | AttackAdvantageRatio | RetreatRatio | RegroupDurationMs | DefendRadiusTiles |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Easy | 1200 | 7 | 7000 | 9 | 7 | 1.32 | 0.72 | 5200 | 11 |
-| Normal | 750 | 10 | 4200 | 11 | 8 | 1.08 | 0.58 | 4000 | 12 |
-| Hard | 520 | 13 | 2500 | 12 | 9 | 0.92 | 0.46 | 3000 | 13 |
+| Difficulty | AiDelayMs | TargetWorkers | ScoutDelayMs | ScoutMaxExposureMs | ScoutReentryDelayMs | PushMinPower | HarassMinPower | AttackAdvantageRatio | RetreatRatio | RegroupDurationMs | DefendRadiusTiles |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Easy | 1200 | 7 | 7000 | 1350 | 1650 | 9 | 7 | 1.32 | 0.72 | 5200 | 11 |
+| Normal | 750 | 10 | 4200 | 900 | 900 | 11 | 8 | 1.08 | 0.58 | 4000 | 12 |
+| Hard | 520 | 13 | 2500 | 650 | 550 | 12 | 9 | 0.92 | 0.46 | 3000 | 13 |
 
 Что это значит практически:
 
@@ -57,6 +57,10 @@
   Сколько workers AI хочет держать в экономике.
 - `ScoutDelayMs`
   Когда AI начинает активно искать базу игрока.
+- `ScoutMaxExposureMs`
+  Сколько scout может прожить внутри опасного окна до обязательного disengage.
+- `ScoutReentryDelayMs`
+  Минимальная пауза перед повторным заходом с другого сектора.
 - `PushMinPower`
   Минимальная сила main army для полноценного push.
 - `HarassMinPower`
@@ -215,9 +219,19 @@ AI не раздает приказы наугад каждому юниту в�
 
 Поведение:
 
-- выбирает быстрого разведчика из main army
-- если армии нет, может использовать worker fallback
-- отправляет scout к предполагаемой базе игрока
+- выбирает разведчика по `speed + sight + survivability`, с приоритетом `Knight -> Archer -> Footman`
+- если армии нет, может использовать один закрепленный worker fallback, но только когда есть безопасный вход/выход
+- во время `Scout` юнит находится в non-combat lock и не атакует вообще
+- живет как recon-cycle:
+  - `ApproachEdge`
+  - `Peek`
+  - `BreakContact`
+  - `Reposition`
+  - `ReEnter`
+- кратко входит в vision edge около worker line / outer building / tower perimeter / army edge
+- заранее планирует `entry`, `planned exit` и `fallback exit`
+- при прямой угрозе или по истечении exposure window немедленно ломает контакт
+- на `Normal` и `Hard` старается не заходить 2 раза подряд через один и тот же сектор
 - остальная армия не коммитится в бой, а ждет ближе к staging area
 
 Важный нюанс:
@@ -294,9 +308,18 @@ AI не раздает приказы наугад каждому юниту в�
 Поведение:
 
 - main army остается ближе к staging point
-- harass squad идет по `FindHarassTargetPosition(...)`
-- приоритет цели смещается в сторону workers
-- если worker не найден, fallback теперь тоже старается заходить через более естественную outer target / точку входа, а не просто в `TownHall`
+- harass squad теперь живет как отдельная mission-state машина:
+  - `Approach`
+  - `Raid`
+  - `Disengage`
+  - `Recover`
+- в early/mid game `Harass` пытается бить экономику:
+  - worker line
+  - gold line
+  - outer buildings
+- `TownHall` не считается нормальной ранней harass-целью, пока есть более логичные экономические или outer targets
+- если рейд уже дал выгоду, но локальная драка ломается не в пользу AI, harass-отряд уходит в recover вместо тупого залипания под базой
+- если общий перевес AI уже достаточно большой, harass не эскалирует сам в мини-push, а отзывается под общий `Regroup/Push`
 
 ### Finish
 
@@ -396,10 +419,15 @@ AI начинает считать siege полезным, если:
 
 Если профиль `Harass`:
 
-- при достаточном размере армии и наличии known player base AI может выделить до `2` юнитов в `harassSquad`
+- при достаточном размере армии и наличии known player base AI может выделять динамический `harassSquad`
 - `Catapult` никогда не идет в harass
-- `Knight` имеют приоритет как кандидаты в harass squad
-- AI следит, чтобы после выделения у него не развалилась main army
+- приоритет кандидатов:
+  - `Knight`
+  - `Archer`
+  - `Footman`
+- AI следит, чтобы после выделения у него не развалилась main army:
+  - в основе должны остаться frontline units
+  - main army должна сохранять большую часть общей силы
 
 ## Formation и командование
 
@@ -427,6 +455,8 @@ AI начинает считать siege полезным, если:
 
 ### На стратегическом уровне
 
+`Push` и `Harass` теперь разведены сильнее.
+
 `FindPushTargetPosition(...)` предпочитает remembered buildings с весами:
 
 - `Tower`
@@ -440,15 +470,18 @@ AI начинает считать siege полезным, если:
 - если в свежей памяти есть что-то кроме `TownHall`, push не должен первым делом тоннелить в `TownHall`
 - если свежих outer targets нет, AI использует точку подхода к базе, а не всегда центр `TownHall`
 
-`FindHarassTargetPosition(...)` старается найти remembered worker.
+У `Harass` вместо старого "маленького push target" теперь отдельный выбор raid objective:
 
-Если worker не найден:
-
-- fallback идет в push target
+1. Видимые workers
+2. Remembered workers около resource line
+3. Mines / economic approach points
+4. Outer buildings
+5. Walkable outer-ring approach points
+6. `TownHall` только как последний fallback
 
 ### На tactical уровне
 
-`FindPreferredVisibleEnemy(...)` работает только с реально видимыми целями.
+`FindPreferredVisibleEnemy(...)` по-прежнему работает для обычных squad-потасовок.
 
 Приоритет сейчас такой:
 
@@ -457,7 +490,12 @@ AI начинает считать siege полезным, если:
 3. Для ranged юнитов боевые цели особенно приоритетны.
 4. Если видимых юнитов нет, AI переходит на здания.
 
-Это важная недавняя правка: раньше AI мог слишком рано залипать в здания даже при наличии юнитов рядом.
+Для `Harass` поверх этого добавлен отдельный local target selection:
+
+- workers имеют наивысший приоритет
+- боевые юниты важны как блокеры рейда и как угроза при retreat
+- outer buildings важнее `TownHall`
+- `TownHall` получает сильный штраф, если рядом есть workers, defense units или outer buildings
 
 ### Переоценка цели во время атаки
 
@@ -518,6 +556,7 @@ AI пользуется тем же pathfinding, что и игрок:
 - multiple goal candidates
 - soft tile penalties
 - anti-stuck recovery
+- near-goal slot selection для боя, ресурсов и стройки
 
 Это важно, потому что крупные squad-команды AI теперь меньше склонны к идеально одинаковым путям.
 
@@ -610,10 +649,12 @@ AI пока не понимает, например:
 - AI все еще честно видит только то, что должен видеть
 - difficulty не вернулась к income cheat
 - `Push` и `Harass` все еще ощущаются по-разному
+- `Harass` в early game действительно идет в worker line / mines / outer buildings, а не в один и тот же угол `TownHall`
 - ранний `Push` и ранний `Harass` больше не летят слишком тупо прямо в `TownHall`, если рядом есть более логичные цели
 - ranged не идут вперед melee без причины
 - siege не умирает первой из-за плохого стейджинга
 - AI переключается со зданий на подошедших вражеских юнитов в ближнем бою
+- успешный рейд умеет вовремя disengage и перейти в recover, если локальная драка стала невыгодной
 - AI умеет defend при раннем давлении
 - после retreat AI реально regroup-ится, а не зацикливается
 

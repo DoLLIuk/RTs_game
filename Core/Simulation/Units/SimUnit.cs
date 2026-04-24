@@ -90,6 +90,9 @@ public sealed class SimUnit : ICombatTarget
     public Vector2? AttackMoveTarget { get; set; }
     public double PathRepathMs { get; set; }
     public double StuckAccumMs { get; set; }
+    public double PathProgressStallMs { get; set; }
+    public double LastHeavyRerouteMs { get; set; } = -99999d;
+    public float LastPathProgressMetric { get; set; } = float.PositiveInfinity;
     public double LastAttackMs { get; set; }
     public ICombatTarget? TargetCombat { get; set; }
     public SimResourceNode? TargetResource { get; set; }
@@ -110,12 +113,15 @@ public sealed class SimUnit : ICombatTarget
     public float WorkerSafeCombatRadius { get; set; }
     public float WorkerCombatLeashRadius { get; set; }
     public double WorkerThreatQuietMs { get; set; }
+    public bool IsNonCombatScout { get; set; }
 
     public void SetPath(IEnumerable<Vector2> points)
     {
         Path.Clear();
         Path.AddRange(points);
         StuckAccumMs = 0d;
+        PathProgressStallMs = 0d;
+        LastPathProgressMetric = float.PositiveInfinity;
     }
 
     public void SetState(UnitState state)
@@ -133,6 +139,9 @@ public sealed class SimUnit : ICombatTarget
             PathDestination = null;
             AttackMoveTarget = null;
             StuckAccumMs = 0d;
+            PathProgressStallMs = 0d;
+            LastHeavyRerouteMs = -99999d;
+            LastPathProgressMetric = float.PositiveInfinity;
         }
     }
 
@@ -144,6 +153,9 @@ public sealed class SimUnit : ICombatTarget
         AttackMoveTarget = null;
         PathRepathMs = 0d;
         StuckAccumMs = 0d;
+        PathProgressStallMs = 0d;
+        LastHeavyRerouteMs = -99999d;
+        LastPathProgressMetric = float.PositiveInfinity;
         TargetCombat = null;
         TargetResource = null;
         TargetBuilding = null;
