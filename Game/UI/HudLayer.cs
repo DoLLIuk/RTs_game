@@ -38,6 +38,9 @@ public partial class HudLayer : CanvasLayer
     public delegate void PauseResumeRequestedEventHandler();
 
     [Signal]
+    public delegate void DebugModeChangedEventHandler(bool enabled);
+
+    [Signal]
     public delegate void MinimapMoveRequestedEventHandler(Vector2 worldPosition);
 
     private ResourcePanel _resourcePanel = null!;
@@ -47,8 +50,12 @@ public partial class HudLayer : CanvasLayer
     private PanelContainer _minimapPanel = null!;
     private MinimapControl _minimap = null!;
     private Label _flashMessage = null!;
+    private Label _debugOverlay = null!;
     private GameOverPanel _gameOverPanel = null!;
     private PanelContainer _pausePanel = null!;
+    private VBoxContainer _pauseMenuColumn = null!;
+    private VBoxContainer _pauseSettingsColumn = null!;
+    private CheckBox _debugModeCheckBox = null!;
     private HudViewState? _lastViewState;
 
     public override void _Ready()
@@ -62,6 +69,7 @@ public partial class HudLayer : CanvasLayer
     {
         Show();
         _flashMessage.Hide();
+        _debugOverlay.Hide();
         _gameOverPanel.UpdateWinner(null);
         _pausePanel.Hide();
     }
@@ -70,6 +78,7 @@ public partial class HudLayer : CanvasLayer
     {
         Hide();
         _flashMessage.Hide();
+        _debugOverlay.Hide();
         _gameOverPanel.UpdateWinner(null);
         _pausePanel.Hide();
         _lastViewState = null;
@@ -79,12 +88,31 @@ public partial class HudLayer : CanvasLayer
 
     public void ShowPauseMenu()
     {
+        ShowPauseMain();
         _pausePanel.Show();
     }
 
     public void HidePauseMenu()
     {
+        ShowPauseMain();
         _pausePanel.Hide();
+    }
+
+    public void SetDebugMode(bool enabled)
+    {
+        _debugModeCheckBox.ButtonPressed = enabled;
+    }
+
+    public void UpdateDebugOverlay(bool enabled, string text)
+    {
+        if (!enabled)
+        {
+            _debugOverlay.Hide();
+            return;
+        }
+
+        _debugOverlay.Text = text;
+        _debugOverlay.Show();
     }
 
     public void UpdateState(
@@ -213,6 +241,14 @@ public partial class HudLayer : CanvasLayer
         _flashMessage.Hide();
         AddChild(_flashMessage);
 
+        _debugOverlay = HudUiFactory.CreateLabel(18, new Color(0.98f, 0.92f, 0.62f));
+        _debugOverlay.Size = new Vector2(420f, 54f);
+        _debugOverlay.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        _debugOverlay.HorizontalAlignment = HorizontalAlignment.Right;
+        PinTopRight(_debugOverlay, 18f, 320f);
+        _debugOverlay.Hide();
+        AddChild(_debugOverlay);
+
         _gameOverPanel = new GameOverPanel
         {
             Size = new Vector2(420f, 240f)
@@ -223,32 +259,72 @@ public partial class HudLayer : CanvasLayer
         _gameOverPanel.Hide();
         AddChild(_gameOverPanel);
 
-        _pausePanel = HudUiFactory.CreatePanel(Vector2.Zero, new Vector2(420f, 250f));
+        _pausePanel = HudUiFactory.CreatePanel(Vector2.Zero, new Vector2(460f, 290f));
         CenterControl(_pausePanel);
         var pauseMargin = HudUiFactory.AddMargin(_pausePanel);
-        var pauseColumn = new VBoxContainer();
-        pauseColumn.AddThemeConstantOverride("separation", 16);
-        pauseMargin.AddChild(pauseColumn);
+        _pauseMenuColumn = new VBoxContainer();
+        _pauseMenuColumn.AddThemeConstantOverride("separation", 16);
+        pauseMargin.AddChild(_pauseMenuColumn);
 
         var pauseTitle = HudUiFactory.CreateLabel(30);
         pauseTitle.Text = GameUiText.PauseTitle;
         pauseTitle.HorizontalAlignment = HorizontalAlignment.Center;
-        pauseColumn.AddChild(pauseTitle);
+        _pauseMenuColumn.AddChild(pauseTitle);
 
         var resumeButton = HudUiFactory.CreateActionButton(GameUiText.PauseResume);
         resumeButton.Pressed += () => EmitSignal(SignalName.PauseResumeRequested);
-        pauseColumn.AddChild(resumeButton);
+        _pauseMenuColumn.AddChild(resumeButton);
 
         var settingsButton = HudUiFactory.CreateActionButton(GameUiText.PauseSettings);
-        settingsButton.Pressed += () => ShowMessage(GameUiText.MessageSettingsStub);
-        pauseColumn.AddChild(settingsButton);
+        settingsButton.Pressed += ShowPauseSettings;
+        _pauseMenuColumn.AddChild(settingsButton);
 
         var mainMenuButton = HudUiFactory.CreateActionButton(GameUiText.PauseMainMenu);
         mainMenuButton.Pressed += () => EmitSignal(SignalName.ReturnToMenuRequested);
-        pauseColumn.AddChild(mainMenuButton);
+        _pauseMenuColumn.AddChild(mainMenuButton);
+
+        _pauseSettingsColumn = new VBoxContainer();
+        _pauseSettingsColumn.AddThemeConstantOverride("separation", 12);
+        _pauseSettingsColumn.Hide();
+        pauseMargin.AddChild(_pauseSettingsColumn);
+
+        var settingsTitle = HudUiFactory.CreateLabel(30);
+        settingsTitle.Text = GameUiText.PauseSettingsTitle;
+        settingsTitle.HorizontalAlignment = HorizontalAlignment.Center;
+        _pauseSettingsColumn.AddChild(settingsTitle);
+
+        _debugModeCheckBox = new CheckBox
+        {
+            Text = GameUiText.PauseDebugMode,
+            MouseFilter = Control.MouseFilterEnum.Stop,
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
+        };
+        _debugModeCheckBox.Toggled += enabled => EmitSignal(SignalName.DebugModeChanged, enabled);
+        _pauseSettingsColumn.AddChild(_debugModeCheckBox);
+
+        var debugHint = HudUiFactory.CreateLabel(14, new Color(0.78f, 0.82f, 0.88f));
+        debugHint.Text = GameUiText.PauseDebugModeHint;
+        debugHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        _pauseSettingsColumn.AddChild(debugHint);
+
+        var backButton = HudUiFactory.CreateActionButton(GameUiText.PauseSettingsBack);
+        backButton.Pressed += ShowPauseMain;
+        _pauseSettingsColumn.AddChild(backButton);
 
         _pausePanel.Hide();
         AddChild(_pausePanel);
+    }
+
+    private void ShowPauseMain()
+    {
+        _pauseMenuColumn.Show();
+        _pauseSettingsColumn.Hide();
+    }
+
+    private void ShowPauseSettings()
+    {
+        _pauseMenuColumn.Hide();
+        _pauseSettingsColumn.Show();
     }
 
     private static void PinTopLeft(Control control, float left, float top)

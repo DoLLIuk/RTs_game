@@ -21,7 +21,8 @@ public static class Pathfinder
         Vector2I goal,
         int goalRadiusTiles = 0,
         int tieBreakerSeed = 0,
-        IReadOnlyDictionary<int, float>? tilePenalty = null)
+        IReadOnlyDictionary<int, float>? tilePenalty = null,
+        bool allowStartAsGoal = true)
     {
         if (!map.InBounds(goal.X, goal.Y))
         {
@@ -34,13 +35,22 @@ public static class Pathfinder
             return [];
         }
 
+        if (!allowStartAsGoal)
+        {
+            actualGoals.RemoveAll(candidate => candidate == start);
+            if (actualGoals.Count == 0)
+            {
+                return [];
+            }
+        }
+
         var goalKeys = new HashSet<int>();
         foreach (var actualGoal in actualGoals)
         {
             goalKeys.Add(Key(actualGoal.X, actualGoal.Y));
         }
 
-        if (goalKeys.Contains(Key(start.X, start.Y)))
+        if (allowStartAsGoal && goalKeys.Contains(Key(start.X, start.Y)))
         {
             return [];
         }

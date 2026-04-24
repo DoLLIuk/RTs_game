@@ -124,8 +124,6 @@ internal static class GameUiText
     public const string MessageOrdersCleared = "Приказы сброшены";
     public const string MessageVictory = "Победа!";
     public const string MessageDefeat = "Поражение!";
-    public const string MessageSettingsStub = "Settings will be added later";
-
     public const string MarkerBuildingDown = "Здание уничтожено";
     public const string MarkerUnitDown = "Юнит уничтожен";
     public const string MarkerUnitReady = "Юнит готов";
@@ -155,6 +153,11 @@ internal static class GameUiText
     public const string PauseResume = "Resume";
     public const string PauseSettings = "Settings";
     public const string PauseMainMenu = "Main Menu";
+    public const string PauseSettingsTitle = "Settings";
+    public const string PauseSettingsBack = "Back";
+    public const string PauseDebugMode = "Debug mode";
+    public const string PauseDebugModeHint = "Показывает FPS, тики и вражеских юнитов без изменения симуляции, логики и fog snapshot для AI.";
+    public const string DebugOverlayFormat = "DEBUG  |  FPS: {0}  |  TPS: {1}  |  Ticks: {2}";
 
     public const string ResourceGoldLabel = "Gold";
     public const string ResourceLumberLabel = "Lumber";

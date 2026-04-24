@@ -18,7 +18,14 @@ public sealed class GameSimulation
     private const float CombatBuildingTargetPenalty = 72f;
     private const float CombatRetargetBuffer = 18f;
     private const float AiAssaultStandoffDistance = GameConstants.TileSize * 3f;
-    private const float HeavyRerouteCooldownMs = 450f;
+    private const float HeavyRerouteCooldownMs = 650f;
+    private const float HeavyRerouteTriggerMs = 1100f;
+    private const float CompactSideStepFactor = 0.45f;
+    private const float CompactForwardBiasFactor = 0.2f;
+    private const float SoftUnitTilePenalty = 2.1f;
+    private const float SoftUnitNeighborTilePenalty = 0.35f;
+    private const float StaticBlockerTilePenalty = 110f;
+    private const float StaticBlockerNeighborTilePenalty = 18f;
     private const float HarassRecoverDurationMs = 3200f;
     private const float HarassNoTradeWindowMs = 2500f;
     private const float HarassRaidActivationDistance = GameConstants.TileSize * 2.5f;
@@ -28,9 +35,15 @@ public sealed class GameSimulation
     private const float ScoutContinueAfterConfirmMs = 5200f;
     private const float ScoutDangerBuffer = GameConstants.TileSize * 1.75f;
     private const float ScoutSectorThreatRadius = GameConstants.TileSize * 4.5f;
-    private const float ScoutPeekArrivalDistance = GameConstants.TileSize * 1.15f;
+    private const float ScoutPeekCompletionDistance = GameConstants.TileSize * 0.38f;
     private const float ScoutEntryArrivalDistance = GameConstants.TileSize * 0.95f;
+    private const float ScoutMinVisibleCommitMs = 260f;
     private const int ScoutMaxVisibleEntryTiles = 1;
+    private const int ScoutMinPeekVisibleTiles = 2;
+    private const int FrontierScoutPreferredPeekDepthTiles = 2;
+    private const int FrontierScoutMaxPeekDepthTiles = 3;
+
+    private readonly record struct CombatApproachSlot(Vector2 Target, float ArrivalRadius);
 
     public event Action<Vector2, Vector2, GameSide, bool, bool>? ProjectileLaunched;
     public event Action<Vector2, bool, int>? HitOccurred;
@@ -592,7 +605,14 @@ public sealed class GameSimulation
         {
             if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
             {
-                Repath(unit, target.Position, range);
+                if (TryBuildCombatApproachTarget(unit, target, out var approachTarget, out var approachArrivalRadius))
+                {
+                    Repath(unit, approachTarget, approachArrivalRadius);
+                }
+                else
+                {
+                    Repath(unit, target.Position, range);
+                }
             }
 
             AdvanceWithRecovery(unit, delta);
@@ -1371,6 +1391,7 @@ public sealed class GameSimulation
         var start = Map.WorldToTile(unit.Position);
         var goal = Map.WorldToTile(worldTarget);
         var goalRadiusTiles = int.Max(0, Mathf.CeilToInt(arrivalRadius / GameConstants.TileSize));
+        var allowStartAsGoal = arrivalRadius <= 0f || unit.Position.DistanceTo(worldTarget) <= arrivalRadius + 0.5f;
         var previousPath = preserveExistingPathOnFailure ? new List<Vector2>(unit.Path) : null;
         var previousDestination = unit.PathDestination;
         var tilePenalty = BuildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
@@ -1380,9 +1401,19 @@ public sealed class GameSimulation
             goal,
             goalRadiusTiles,
             unit.Id % 8,
-            tilePenalty);
+            tilePenalty,
+            allowStartAsGoal);
         if (tilePath.Count == 0)
         {
+            if (!allowStartAsGoal &&
+                TryBuildCloseRangeFallbackPath(unit, worldTarget, arrivalRadius, out var fallbackPath))
+            {
+                unit.SetPath(fallbackPath);
+                unit.PathDestination = worldTarget;
+                unit.PathRepathMs = 0d;
+                return true;
+            }
+
             if (preserveExistingPathOnFailure && previousPath is not null)
             {
                 unit.SetPath(previousPath);
@@ -1413,6 +1444,37 @@ public sealed class GameSimulation
         return true;
     }
 
+    private bool TryBuildCloseRangeFallbackPath(SimUnit unit, Vector2 worldTarget, float arrivalRadius, out List<Vector2> path)
+    {
+        path = [];
+        if (arrivalRadius <= 0f)
+        {
+            return false;
+        }
+
+        var distance = unit.Position.DistanceTo(worldTarget);
+        if (distance > arrivalRadius + GameConstants.TileSize * 1.4f)
+        {
+            return false;
+        }
+
+        var direction = unit.Position - worldTarget;
+        if (direction.LengthSquared() <= 0.01f)
+        {
+            direction = Vector2.Right;
+        }
+
+        var stopDistance = Mathf.Max(arrivalRadius * 0.9f, unit.Radius + 2f);
+        var candidate = worldTarget + direction.Normalized() * stopDistance;
+        if (!TryMoveToCandidate(unit, candidate, 1.5f))
+        {
+            return false;
+        }
+
+        path.Add(candidate);
+        return true;
+    }
+
     private Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
     {
         var penalty = new Dictionary<int, float>();
@@ -1437,9 +1499,10 @@ public sealed class GameSimulation
 
             var goalSlack = goalRadiusTiles + 1;
             var nearGoal = Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack;
-            if (!nearGoal)
+            var sharedCombatTarget = SharesCombatTarget(unit, other);
+            if (!nearGoal || !sharedCombatTarget)
             {
-                AddTilePenalty(penalty, occupied.X, occupied.Y, 7f);
+                AddTilePenalty(penalty, occupied.X, occupied.Y, sharedCombatTarget ? SoftUnitNeighborTilePenalty : SoftUnitTilePenalty);
                 for (var dy = -1; dy <= 1; dy++)
                 {
                     for (var dx = -1; dx <= 1; dx++)
@@ -1449,7 +1512,7 @@ public sealed class GameSimulation
                             continue;
                         }
 
-                        AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, 1.25f);
+                        AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, SoftUnitNeighborTilePenalty);
                     }
                 }
             }
@@ -1459,7 +1522,7 @@ public sealed class GameSimulation
                 continue;
             }
 
-            AddTilePenalty(penalty, occupied.X, occupied.Y, 220f);
+            AddTilePenalty(penalty, occupied.X, occupied.Y, StaticBlockerTilePenalty);
             for (var dy = -1; dy <= 1; dy++)
             {
                 for (var dx = -1; dx <= 1; dx++)
@@ -1469,7 +1532,7 @@ public sealed class GameSimulation
                         continue;
                     }
 
-                    AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, 42f);
+                    AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, StaticBlockerNeighborTilePenalty);
                 }
             }
         }
@@ -1479,6 +1542,11 @@ public sealed class GameSimulation
 
     private bool ShouldTreatAsTemporaryBlocker(SimUnit mover, SimUnit other, Vector2 goalWorld, int goalRadiusTiles)
     {
+        if (SharesCombatTarget(mover, other))
+        {
+            return false;
+        }
+
         if (!IsLikelyStaticBlocker(other))
         {
             return false;
@@ -1491,11 +1559,6 @@ public sealed class GameSimulation
         if (!nearGoal && !inCorridor)
         {
             return false;
-        }
-
-        if (mover.TargetCombat is not null && other.TargetCombat == mover.TargetCombat)
-        {
-            return true;
         }
 
         if (mover.TargetResource is not null && other.TargetResource == mover.TargetResource)
@@ -1516,6 +1579,14 @@ public sealed class GameSimulation
         return nearGoal || inCorridor;
     }
 
+    private static bool SharesCombatTarget(SimUnit first, SimUnit second)
+    {
+        return first.TargetCombat is not null &&
+               first.TargetCombat == second.TargetCombat &&
+               first.CanAttack() &&
+               second.CanAttack();
+    }
+
     private static bool IsLikelyStaticBlocker(SimUnit unit)
     {
         if (unit.State is UnitState.Attack or UnitState.Gather or UnitState.Build or UnitState.ReturnCargo)
@@ -1525,7 +1596,7 @@ public sealed class GameSimulation
 
         if (unit.State is UnitState.Move or UnitState.AttackMove)
         {
-            return unit.Path.Count == 0 || unit.StuckAccumMs >= 180d;
+            return unit.Path.Count == 0 || unit.StuckAccumMs >= 320d;
         }
 
         return unit.State == UnitState.Idle;
@@ -1545,6 +1616,221 @@ public sealed class GameSimulation
         return point.DistanceTo(projection);
     }
 
+    private bool AdvanceAlongPathWithSteering(SimUnit unit, double delta)
+    {
+        if (!unit.Alive || unit.Path.Count == 0)
+        {
+            return false;
+        }
+
+        var step = unit.Speed * (float)delta;
+        var next = unit.Path[0];
+        var toNext = next - unit.Position;
+        var distance = toNext.Length();
+        if (distance <= step)
+        {
+            if (TryMoveToCandidate(unit, next, 1.5f))
+            {
+                unit.Position = next;
+                unit.Path.RemoveAt(0);
+                return unit.Path.Count > 0;
+            }
+
+            return TrySteeredAdvance(unit, distance <= 0.01f ? Vector2.Right : toNext / distance, step);
+        }
+
+        var direction = toNext / distance;
+        var direct = unit.Position + direction * step;
+        if (TryMoveToCandidate(unit, direct, 1.5f))
+        {
+            unit.Position = direct;
+            return true;
+        }
+
+        return TrySteeredAdvance(unit, direction, step);
+    }
+
+    private bool TrySteeredAdvance(SimUnit unit, Vector2 direction, float step)
+    {
+        if (direction.LengthSquared() <= 0.001f || step <= 0.01f)
+        {
+            return false;
+        }
+
+        var blocker = FindMovementBlocker(unit, unit.Position + direction * step, 1.5f);
+        if (blocker is null)
+        {
+            return false;
+        }
+
+        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
+        var perpendicular = new Vector2(-direction.Y, direction.X);
+        var sideStep = Mathf.Clamp(step * CompactSideStepFactor, 2f, GameConstants.LocalAvoidanceStep * 0.8f);
+        var forwardBias = direction * Mathf.Min(step * CompactForwardBiasFactor, sideStep * 0.6f);
+        var offsets = new[]
+        {
+            forwardBias + perpendicular * preferredSide * sideStep,
+            forwardBias - perpendicular * preferredSide * sideStep
+        };
+
+        foreach (var offset in offsets)
+        {
+            var candidate = unit.Position + offset;
+            if (!TryMoveToCandidate(unit, candidate, 1.5f))
+            {
+                continue;
+            }
+
+            unit.Position = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private SimUnit? FindMovementBlocker(SimUnit unit, Vector2 candidate, float padding)
+    {
+        SimUnit? best = null;
+        var bestDistance = float.PositiveInfinity;
+        foreach (var other in Units)
+        {
+            if (!other.Alive || other == unit)
+            {
+                continue;
+            }
+
+            var minimum = unit.Radius + other.Radius + padding;
+            var distance = candidate.DistanceTo(other.Position);
+            if (distance >= minimum || distance >= bestDistance)
+            {
+                continue;
+            }
+
+            best = other;
+            bestDistance = distance;
+        }
+
+        return best;
+    }
+
+    private static float GetPreferredSteerSide(SimUnit unit, Vector2 direction, SimUnit? blocker)
+    {
+        if (blocker is null)
+        {
+            return unit.Id % 2 == 0 ? 1f : -1f;
+        }
+
+        var perpendicular = new Vector2(-direction.Y, direction.X);
+        var lateralDot = perpendicular.Dot(blocker.Position - unit.Position);
+        if (Mathf.Abs(lateralDot) <= 0.5f)
+        {
+            return unit.Id % 2 == 0 ? 1f : -1f;
+        }
+
+        return lateralDot > 0f ? -1f : 1f;
+    }
+
+    private bool TryBuildCombatApproachTarget(SimUnit unit, ICombatTarget target, out Vector2 approachTarget, out float arrivalRadius)
+    {
+        if (unit.IsRanged() || unit.IsSiege())
+        {
+            var rangedSlot = BuildRangedCombatApproachSlot(unit, target);
+            approachTarget = rangedSlot.Target;
+            arrivalRadius = rangedSlot.ArrivalRadius;
+            return true;
+        }
+
+        var meleeSlot = BuildMeleeCombatApproachSlot(unit, target);
+        approachTarget = meleeSlot.Target;
+        arrivalRadius = meleeSlot.ArrivalRadius;
+        return true;
+    }
+
+    private CombatApproachSlot BuildMeleeCombatApproachSlot(SimUnit unit, ICombatTarget target)
+    {
+        var forward = GetApproachDirection(unit, target);
+        var lateral = new Vector2(-forward.Y, forward.X);
+        var contactDistance = target.Radius + unit.Radius + Mathf.Max(unit.Range * 0.3f, 4f);
+        var contactCenter = target.Position + forward * contactDistance;
+        var contactSlots = target.IsBuilding
+            ? Mathf.Clamp(Mathf.RoundToInt(target.Radius / 12f) + 2, 3, 6)
+            : Mathf.Clamp(Mathf.RoundToInt(target.Radius / 10f) + 1, 2, 4);
+        var rows = target.IsBuilding ? 3 : 2;
+        var assignment = Mathf.PosMod(unit.Id, contactSlots * rows);
+        var lane = CenteredSlotIndex(assignment % contactSlots);
+        var rank = assignment / contactSlots;
+        var laneSpacing = unit.Radius * 2f + 4f;
+        var followSpacing = unit.Radius * 2.1f + 6f;
+        var offset = lateral * (lane * laneSpacing) + forward * (rank * followSpacing);
+        var targetPoint = contactCenter + offset;
+        var arrival = Mathf.Max(unit.Radius * 0.6f, 7f);
+        return new CombatApproachSlot(targetPoint, arrival);
+    }
+
+    private CombatApproachSlot BuildRangedCombatApproachSlot(SimUnit unit, ICombatTarget target)
+    {
+        var forward = GetApproachDirection(unit, target);
+        var baseAngle = Mathf.Atan2(forward.Y, forward.X);
+        var desiredRadius = target.Radius + unit.Radius + Mathf.Max(unit.Range * 0.52f, GameConstants.TileSize * 0.35f);
+        var slotCount = target.IsBuilding ? 4 : 3;
+        var spread = target.IsBuilding ? 0.5f : 0.32f;
+        var ordinal = Mathf.PosMod(unit.Id, slotCount);
+        var t = slotCount == 1 ? 0.5f : ordinal / (float)(slotCount - 1);
+        var angle = baseAngle - spread * 0.5f + spread * t;
+        var offset = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * desiredRadius;
+        var targetPoint = target.Position + offset;
+        var arrival = Mathf.Max(unit.Radius * 0.7f, 8f);
+        return new CombatApproachSlot(targetPoint, arrival);
+    }
+
+    private static Vector2 GetApproachDirection(SimUnit unit, ICombatTarget target)
+    {
+        var direction = unit.Position - target.Position;
+        if (direction.LengthSquared() <= 1f)
+        {
+            var fallbackAngle = Mathf.Tau * (Mathf.PosMod(unit.Id, 8) / 8f);
+            return new Vector2(Mathf.Cos(fallbackAngle), Mathf.Sin(fallbackAngle));
+        }
+
+        return direction.Normalized();
+    }
+
+    private static int CenteredSlotIndex(int ordinal)
+    {
+        if (ordinal == 0)
+        {
+            return 0;
+        }
+
+        var step = (ordinal + 1) / 2;
+        return ordinal % 2 == 1 ? -step : step;
+    }
+
+    private bool TryMoveToCandidate(SimUnit unit, Vector2 candidate, float padding, SimUnit? ignoredUnit = null)
+    {
+        var tile = Map.WorldToTile(candidate);
+        if (!Map.IsWalkable(tile.X, tile.Y))
+        {
+            return false;
+        }
+
+        foreach (var other in Units)
+        {
+            if (!other.Alive || other == unit || other == ignoredUnit)
+            {
+                continue;
+            }
+
+            var minimum = unit.Radius + other.Radius + padding;
+            if (candidate.DistanceTo(other.Position) < minimum)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private bool AdvanceWithRecovery(SimUnit unit, double delta)
     {
         if (!unit.Alive || unit.Path.Count == 0)
@@ -1560,7 +1846,7 @@ public sealed class GameSimulation
         var before = unit.Position;
         var pathCountBefore = unit.Path.Count;
         var expectedStep = unit.Speed * (float)delta;
-        var hasPath = unit.AdvanceAlongPath(delta);
+        var hasPath = AdvanceAlongPathWithSteering(unit, delta);
         var moved = before.DistanceTo(unit.Position);
         var reachedWaypoint = unit.Path.Count < pathCountBefore;
         var movedEnough = moved >= float.Max(GameConstants.StuckMovedEpsilon, expectedStep * 0.18f);
@@ -1574,10 +1860,13 @@ public sealed class GameSimulation
             unit.StuckAccumMs = 0d;
         }
 
-        if (hasPath && (unit.StuckAccumMs >= GameConstants.StuckRepathDelayMs ||
-                        unit.PathProgressStallMs >= GameConstants.StuckRepathDelayMs))
+        var needsRecovery = hasPath && (unit.StuckAccumMs >= GameConstants.StuckRepathDelayMs ||
+                                        unit.PathProgressStallMs >= GameConstants.StuckRepathDelayMs);
+        if (needsRecovery)
         {
-            ResolveLocalStuck(unit);
+            var allowHeavyReroute = unit.StuckAccumMs >= HeavyRerouteTriggerMs ||
+                                    unit.PathProgressStallMs >= HeavyRerouteTriggerMs;
+            ResolveLocalStuck(unit, allowHeavyReroute);
         }
 
         return hasPath;
@@ -1613,61 +1902,73 @@ public sealed class GameSimulation
         return remaining;
     }
 
-    private void ResolveLocalStuck(SimUnit unit)
+    private void ResolveLocalStuck(SimUnit unit, bool allowHeavyReroute)
     {
         unit.StuckAccumMs = 0d;
         unit.PathProgressStallMs = 0d;
         if (TryLocalAvoidanceStep(unit))
         {
-            if (_elapsedMs - unit.LastHeavyRerouteMs < HeavyRerouteCooldownMs)
+            return;
+        }
+
+        if (TryGetRepathTarget(unit, out var repathTarget, out var arrivalRadius))
+        {
+            if (Repath(unit, repathTarget, arrivalRadius, preserveExistingPathOnFailure: true))
             {
                 return;
             }
-        }
 
-        if (TryGetRepathTarget(unit, out var repathTarget))
-        {
-            if (_elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
+            if (allowHeavyReroute && _elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
             {
-                var arrivalRadius = GetArrivalRadius(unit);
                 Repath(unit, repathTarget, arrivalRadius, stuckReroute: true, preserveExistingPathOnFailure: true);
             }
         }
     }
 
-    private bool TryGetRepathTarget(SimUnit unit, out Vector2 target)
+    private bool TryGetRepathTarget(SimUnit unit, out Vector2 target, out float arrivalRadius)
     {
         if (unit.TargetCombat is { Alive: true } combat)
         {
+            if (TryBuildCombatApproachTarget(unit, combat, out target, out arrivalRadius))
+            {
+                return true;
+            }
+
             target = combat.Position;
+            arrivalRadius = GetAttackRange(unit, combat);
             return true;
         }
 
         if (unit.TargetResource is { Alive: true } resource)
         {
             target = GetWorkerGatherPathTarget(unit, resource);
+            arrivalRadius = resource.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
             return true;
         }
 
         if (unit.ReturnBuilding is { Alive: true } hall)
         {
             target = GetWorkerReturnPathTarget(unit, hall);
+            arrivalRadius = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
             return true;
         }
 
         if (unit.TargetBuilding is { Alive: true } site)
         {
             target = site.Center;
+            arrivalRadius = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
             return true;
         }
 
         if (unit.PathDestination.HasValue)
         {
             target = unit.PathDestination.Value;
+            arrivalRadius = 0f;
             return true;
         }
 
         target = Vector2.Zero;
+        arrivalRadius = 0f;
         return false;
     }
 
@@ -1739,31 +2040,6 @@ public sealed class GameSimulation
         return true;
     }
 
-    private float GetArrivalRadius(SimUnit unit)
-    {
-        if (unit.TargetCombat is { Alive: true } combat)
-        {
-            return GetAttackRange(unit, combat);
-        }
-
-        if (unit.TargetResource is { Alive: true } resource)
-        {
-            return resource.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        }
-
-        if (unit.ReturnBuilding is { Alive: true } hall)
-        {
-            return hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        }
-
-        if (unit.TargetBuilding is { Alive: true } site)
-        {
-            return site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-        }
-
-        return 0f;
-    }
-
     private bool TryLocalAvoidanceStep(SimUnit unit)
     {
         if (unit.Path.Count == 0)
@@ -1778,13 +2054,14 @@ public sealed class GameSimulation
         }
 
         direction = direction.Normalized();
-        var side = unit.Id % 2 == 0 ? 1f : -1f;
-        var perpendicular = new Vector2(-direction.Y, direction.X) * side;
+        var blocker = FindMovementBlocker(unit, unit.Position + direction * GameConstants.LocalAvoidanceStep, 1.5f);
+        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
+        var perpendicular = new Vector2(-direction.Y, direction.X) * preferredSide;
+        var sideStep = GameConstants.LocalAvoidanceStep * 0.7f;
         var offsets = new[]
         {
-            perpendicular * GameConstants.LocalAvoidanceStep,
-            -perpendicular * GameConstants.LocalAvoidanceStep,
-            direction * (GameConstants.LocalAvoidanceStep * 0.65f)
+            perpendicular * sideStep,
+            -perpendicular * sideStep
         };
 
         foreach (var offset in offsets)
@@ -1801,24 +2078,9 @@ public sealed class GameSimulation
     private bool TryMoveIntoFreeSpace(SimUnit unit, Vector2 offset)
     {
         var candidate = unit.Position + offset;
-        var tile = Map.WorldToTile(candidate);
-        if (!Map.IsWalkable(tile.X, tile.Y))
+        if (!TryMoveToCandidate(unit, candidate, 2f))
         {
             return false;
-        }
-
-        foreach (var other in Units)
-        {
-            if (!other.Alive || other == unit)
-            {
-                continue;
-            }
-
-            var minimum = unit.Radius + other.Radius + 2f;
-            if (candidate.DistanceTo(other.Position) < minimum)
-            {
-                return false;
-            }
         }
 
         unit.Position = candidate;
@@ -1833,7 +2095,7 @@ public sealed class GameSimulation
 
     private void ApplySeparation(double delta)
     {
-        var strength = Math.Min(1d, delta / 0.01667d) * 1.4d;
+        var strength = Math.Min(1d, delta / 0.01667d) * 0.55d;
         for (var i = 0; i < Units.Count; i++)
         {
             var first = Units[i];
@@ -1850,7 +2112,7 @@ public sealed class GameSimulation
                     continue;
                 }
 
-                var minimum = first.Radius + second.Radius + 4f;
+                var minimum = first.Radius + second.Radius + 1.25f;
                 var deltaVector = second.Position - first.Position;
                 var distance = deltaVector.Length();
                 if (distance <= 0.01f || distance >= minimum)
@@ -1863,10 +2125,16 @@ public sealed class GameSimulation
                     continue;
                 }
 
-                var push = (float)(((minimum - distance) / 2f) * strength);
+                var overlap = minimum - distance;
+                if (overlap <= 0.2f)
+                {
+                    continue;
+                }
+
+                var push = Mathf.Clamp((float)(overlap * 0.35f * strength), 0.2f, 1.4f);
                 var normal = deltaVector / distance;
-                TryNudge(first, -normal * push);
-                TryNudge(second, normal * push);
+                TryNudge(first, -normal * push, second);
+                TryNudge(second, normal * push, first);
             }
         }
     }
@@ -1905,17 +2173,14 @@ public sealed class GameSimulation
         var sideSign = yielder.Id % 2 == 0 ? 1f : -1f;
         var lateral = new Vector2(-leaderDirection.Y, leaderDirection.X) * sideSign;
         var yieldStep = Mathf.Clamp(
-            overlap * 0.55f + GameConstants.LocalAvoidanceStep * 0.2f,
-            GameConstants.DeadlockYieldMinStep,
-            GameConstants.DeadlockYieldMaxStep);
-        var forwardBias = leaderDirection * (yieldStep * 0.25f);
-        var backBias = -leaderDirection * (yieldStep * 0.45f);
+            overlap * 0.32f + GameConstants.LocalAvoidanceStep * 0.12f,
+            GameConstants.DeadlockYieldMinStep * 0.8f,
+            GameConstants.DeadlockYieldMaxStep * 0.75f);
         var offsets = new[]
         {
-            lateral * yieldStep + forwardBias,
-            -lateral * yieldStep + forwardBias,
-            lateral * (yieldStep * 0.65f) + backBias,
-            -lateral * (yieldStep * 0.65f) + backBias
+            lateral * yieldStep,
+            -lateral * yieldStep,
+            -leaderDirection * (yieldStep * 0.45f)
         };
 
         foreach (var offset in offsets)
@@ -1987,11 +2252,10 @@ public sealed class GameSimulation
         };
     }
 
-    private void TryNudge(SimUnit unit, Vector2 offset)
+    private void TryNudge(SimUnit unit, Vector2 offset, SimUnit? ignoredUnit = null)
     {
         var next = unit.Position + offset;
-        var tile = Map.WorldToTile(next);
-        if (!Map.IsWalkable(tile.X, tile.Y))
+        if (!TryMoveToCandidate(unit, next, 1f, ignoredUnit))
         {
             return;
         }
@@ -2986,6 +3250,7 @@ public sealed class GameSimulation
         var savedRouteExposure = _aiScoutMission.CurrentRouteExposure;
         var savedVisibleRun = _aiScoutMission.CurrentVisibleRunLength;
         var savedPeekCompleted = _aiScoutMission.PeekCompleted;
+        var savedRequireSectorSwitch = _aiScoutMission.RequireSectorSwitch;
         var canScout = TryPlanScoutSector(worker, basePosition, baseTile, fallback, allowRepeat: true, out _);
         _aiScoutMission.CurrentSector = savedCurrentSector;
         _aiScoutMission.LastSector = savedLastSector;
@@ -2998,6 +3263,7 @@ public sealed class GameSimulation
         _aiScoutMission.CurrentRouteExposure = savedRouteExposure;
         _aiScoutMission.CurrentVisibleRunLength = savedVisibleRun;
         _aiScoutMission.PeekCompleted = savedPeekCompleted;
+        _aiScoutMission.RequireSectorSwitch = savedRequireSectorSwitch;
         return canScout;
     }
 
@@ -3052,6 +3318,13 @@ public sealed class GameSimulation
             _aiScoutMission.LastThreatPosition = threat.Position;
         }
 
+        if (_aiScoutMission.Phase is ScoutMissionPhase.Peek or ScoutMissionPhase.ReEnter &&
+            _aiScoutMission.ExposureStartedMs < 0d &&
+            IsScoutCurrentlyVisibleToPlayer(scout))
+        {
+            _aiScoutMission.ExposureStartedMs = _elapsedMs;
+        }
+
         if (!HasActiveScoutPlan() &&
             !TryPlanScoutSector(scout, basePosition, baseTile, fallback, allowRepeat: true, out _))
         {
@@ -3071,8 +3344,10 @@ public sealed class GameSimulation
 
             case ScoutMissionPhase.Peek:
             case ScoutMissionPhase.ReEnter:
+                var reachedPeekPoint = ScoutReachedPoint(scout, _aiScoutMission.PeekPoint, ScoutPeekCompletionDistance);
+                var hasVisibleCommit = _aiScoutMission.ExposureStartedMs >= 0d || IsScoutCurrentlyVisibleToPlayer(scout);
                 if (ShouldBreakScoutContact(scout, threat) ||
-                    ScoutReachedPoint(scout, _aiScoutMission.PeekPoint, ScoutPeekArrivalDistance))
+                    (reachedPeekPoint && hasVisibleCommit))
                 {
                     StartScoutBreakContact();
                     return GetScoutBreakContactTarget(scout, fallback);
@@ -3352,7 +3627,7 @@ public sealed class GameSimulation
             return false;
         }
 
-        if (_aiScoutMission.PeekCompleted)
+        if (_aiScoutMission.RequireSectorSwitch)
         {
             var switchedCandidates = SelectNextScoutSectorExcludingLast(routeCandidates, _aiScoutMission.CurrentSector);
             if (switchedCandidates.Count == 0)
@@ -3416,7 +3691,6 @@ public sealed class GameSimulation
         _aiScoutMission.LastIntelTargetKind = bestPlan.IntelKind;
         _aiScoutMission.CurrentRouteExposure = bestPlan.RouteExposure;
         _aiScoutMission.CurrentVisibleRunLength = bestPlan.VisibleRunLength;
-        _aiScoutMission.PeekCompleted = false;
         plan = bestPlan;
         return true;
     }
@@ -3482,33 +3756,39 @@ public sealed class GameSimulation
         peekTile = frontierTile;
         var bestScore = float.PositiveInfinity;
         var found = false;
-        for (var dy = -1; dy <= 1; dy++)
+        for (var depth = 1; depth <= FrontierScoutMaxPeekDepthTiles; depth++)
         {
-            for (var dx = -1; dx <= 1; dx++)
+            for (var dy = -depth; dy <= depth; dy++)
             {
-                if (dx == 0 && dy == 0)
+                for (var dx = -depth; dx <= depth; dx++)
                 {
-                    continue;
-                }
+                    if ((dx == 0 && dy == 0) ||
+                        int.Max(Math.Abs(dx), Math.Abs(dy)) != depth)
+                    {
+                        continue;
+                    }
 
-                var tx = frontierTile.X + dx;
-                var ty = frontierTile.Y + dy;
-                if (!Map.InBounds(tx, ty) ||
-                    !Map.IsWalkable(tx, ty) ||
-                    !IsPlayerVisibleTile(tx, ty))
-                {
-                    continue;
-                }
+                    var tx = frontierTile.X + dx;
+                    var ty = frontierTile.Y + dy;
+                    if (!Map.InBounds(tx, ty) ||
+                        !Map.IsWalkable(tx, ty) ||
+                        !IsPlayerVisibleTile(tx, ty))
+                    {
+                        continue;
+                    }
 
-                var world = Map.TileToWorldCenter(tx, ty);
-                var score = world.DistanceTo(basePosition) * 0.05f +
-                            EstimateScoutSectorThreat(world) * 12f +
-                            EvaluateScoutIntel(world).Score;
-                if (score < bestScore)
-                {
-                    bestScore = score;
-                    peekTile = new Vector2I(tx, ty);
-                    found = true;
+                    var world = Map.TileToWorldCenter(tx, ty);
+                    var depthPenalty = Math.Abs(depth - FrontierScoutPreferredPeekDepthTiles) * 14f;
+                    var score = world.DistanceTo(basePosition) * 0.05f +
+                                EstimateScoutSectorThreat(world) * 12f +
+                                EvaluateScoutIntel(world).Score +
+                                depthPenalty;
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        peekTile = new Vector2I(tx, ty);
+                        found = true;
+                    }
                 }
             }
         }
@@ -3650,7 +3930,7 @@ public sealed class GameSimulation
 
     private bool IsScoutRouteExposureSafe(SimUnit scout, ScoutRouteExposure exposure)
     {
-        var maxVisibleTiles = int.Max(2, Mathf.CeilToInt(scout.Speed * (_difficultyDefinition.ScoutMaxExposureMs / 1000f) / GameConstants.TileSize) + 1);
+        var maxVisibleTiles = int.Max(3, Mathf.CeilToInt(scout.Speed * (_difficultyDefinition.ScoutMaxExposureMs / 1000f) / GameConstants.TileSize) + 2);
         var maxVisibleRunTiles = int.Max(2, maxVisibleTiles - 2);
         if (exposure.EntryVisibleTiles > ScoutMaxVisibleEntryTiles)
         {
@@ -3667,12 +3947,37 @@ public sealed class GameSimulation
             return false;
         }
 
-        if (exposure.PeekVisibleTiles <= 0 || exposure.ExitVisibleTiles > maxVisibleRunTiles)
+        if (exposure.PeekVisibleTiles < ScoutMinPeekVisibleTiles || exposure.ExitVisibleTiles > maxVisibleRunTiles)
         {
             return false;
         }
 
         return exposure.FallbackVisibleTiles <= maxVisibleTiles;
+    }
+
+    private bool IsScoutCurrentlyVisibleToPlayer(SimUnit scout)
+    {
+        var tile = Map.WorldToTile(scout.Position);
+        return IsPlayerVisibleTile(tile.X, tile.Y);
+    }
+
+    private bool IsImmediateScoutThreat(SimUnit scout, ICombatTarget threat)
+    {
+        if (threat is SimUnit enemy)
+        {
+            var distance = scout.Position.DistanceTo(enemy.Position);
+            var threatRange = enemy.Range + scout.Radius + enemy.Radius + ScoutDangerBuffer * 0.35f;
+            return enemy.TargetCombat == scout || distance <= threatRange;
+        }
+
+        if (threat is SimBuilding building)
+        {
+            var distance = scout.Position.DistanceTo(building.Center);
+            var threatRange = building.Range + scout.Radius + ScoutDangerBuffer * 0.2f;
+            return distance <= threatRange;
+        }
+
+        return false;
     }
 
     private bool IsPlayerVisibleTile(int tx, int ty)
@@ -3755,8 +4060,9 @@ public sealed class GameSimulation
     {
         _aiScoutMission.Phase = phase;
         _aiScoutMission.PhaseEnteredMs = _elapsedMs;
-        _aiScoutMission.ExposureStartedMs = _elapsedMs;
+        _aiScoutMission.ExposureStartedMs = -99999d;
         _aiScoutMission.PeekCompleted = false;
+        _aiScoutMission.RequireSectorSwitch = false;
     }
 
     private void StartScoutBreakContact()
@@ -3764,12 +4070,22 @@ public sealed class GameSimulation
         _aiScoutMission.Phase = ScoutMissionPhase.BreakContact;
         _aiScoutMission.PhaseEnteredMs = _elapsedMs;
         _aiScoutMission.PeekCompleted = true;
+        _aiScoutMission.RequireSectorSwitch = true;
     }
 
     private bool ShouldBreakScoutContact(SimUnit scout, ICombatTarget? threat)
     {
+        var inPlayerVision = IsScoutCurrentlyVisibleToPlayer(scout);
+        var visibleCommitMs = _aiScoutMission.ExposureStartedMs >= 0d
+            ? _elapsedMs - _aiScoutMission.ExposureStartedMs
+            : 0d;
         if (threat is not null)
         {
+            if (!inPlayerVision || visibleCommitMs < ScoutMinVisibleCommitMs)
+            {
+                return IsImmediateScoutThreat(scout, threat);
+            }
+
             return true;
         }
 
@@ -3777,6 +4093,11 @@ public sealed class GameSimulation
             _elapsedMs - _aiScoutMission.ExposureStartedMs >= _difficultyDefinition.ScoutMaxExposureMs)
         {
             return true;
+        }
+
+        if (!inPlayerVision || visibleCommitMs < ScoutMinVisibleCommitMs)
+        {
+            return false;
         }
 
         var localThreat = EstimateScoutSectorThreat(scout.Position);
@@ -5622,6 +5943,7 @@ public sealed class GameSimulation
         public int CurrentRouteExposure { get; set; }
         public int CurrentVisibleRunLength { get; set; }
         public bool PeekCompleted { get; set; }
+        public bool RequireSectorSwitch { get; set; }
         public ScoutIntelTargetKind LastIntelTargetKind { get; set; } = ScoutIntelTargetKind.BaseEdge;
 
         public void Reset()
@@ -5647,6 +5969,7 @@ public sealed class GameSimulation
             CurrentRouteExposure = 0;
             CurrentVisibleRunLength = 0;
             PeekCompleted = false;
+            RequireSectorSwitch = false;
             LastIntelTargetKind = ScoutIntelTargetKind.BaseEdge;
         }
     }

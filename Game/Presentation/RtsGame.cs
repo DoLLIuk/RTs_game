@@ -47,11 +47,16 @@ public partial class RtsGame : Node2D
     private bool _attackMoveMode;
     private bool _isActive;
     private bool _isPaused;
+    private bool _debugModeEnabled;
     private string _lastCommand = GameUiText.LastCommandNone;
     private Vector2? _selectionStartWorld;
     private Vector2? _selectionCurrentWorld;
     private bool _selectionAdditive;
     private double _lastUnderAttackNotificationMs = -99999d;
+    private long _simulationTickCount;
+    private int _tickCounterWindow;
+    private double _tickCounterWindowMs;
+    private int _ticksPerSecond;
 
     public override void _Ready()
     {
@@ -84,6 +89,7 @@ public partial class RtsGame : Node2D
         _hud.RestartRequested += () => EmitSignal(SignalName.RestartRequested);
         _hud.ReturnToMenuRequested += () => EmitSignal(SignalName.ReturnToMenuRequested);
         _hud.PauseResumeRequested += TogglePause;
+        _hud.DebugModeChanged += OnDebugModeChanged;
         _hud.MinimapMoveRequested += point =>
         {
             _camera.Position = point;
@@ -126,6 +132,10 @@ public partial class RtsGame : Node2D
         _overlay.Hide();
         _overlay.SyncState(null, null, Vector2.Zero, null, null, null, null, null);
         _hud.HideHud();
+        _simulationTickCount = 0;
+        _tickCounterWindow = 0;
+        _tickCounterWindowMs = 0d;
+        _ticksPerSecond = 0;
         Hide();
     }
 
@@ -138,12 +148,16 @@ public partial class RtsGame : Node2D
 
         if (_isPaused)
         {
+            UpdateDebugOverlay(delta, false);
+            SyncHud();
             return;
         }
 
         UpdateFog();
         PushPlayerVisionSnapshot();
         _simulation.Update(delta);
+        _simulationTickCount++;
+        UpdateDebugOverlay(delta, true);
         UpdateFog();
         UpdateCamera(delta);
         SyncViews();
@@ -276,6 +290,10 @@ public partial class RtsGame : Node2D
         _selectionCurrentWorld = null;
         _lastUnderAttackNotificationMs = -99999d;
         _minimapPings.Clear();
+        _simulationTickCount = 0;
+        _tickCounterWindow = 0;
+        _tickCounterWindowMs = 0d;
+        _ticksPerSecond = 0;
 
         _simulation = new GameSimulation(init);
         SubscribeSimulationEvents(_simulation);
@@ -284,6 +302,7 @@ public partial class RtsGame : Node2D
         _fogOverlayView.SetFog(_fog);
         ConfigureCamera();
         AutoSelectFirstWorker();
+        _hud.SetDebugMode(_debugModeEnabled);
         UpdateFog();
         PushPlayerVisionSnapshot();
         SyncViews();
@@ -803,6 +822,12 @@ public partial class RtsGame : Node2D
         }
     }
 
+    private void OnDebugModeChanged(bool enabled)
+    {
+        _debugModeEnabled = enabled;
+        RefreshPresentationState();
+    }
+
     private bool TryHandleTrainingHotkey(Key key)
     {
         if (_selectedBuilding is null || _selectedBuilding.Side != GameSide.Player || !_selectedBuilding.Completed)
@@ -1282,8 +1307,7 @@ public partial class RtsGame : Node2D
             }
             else
             {
-                var tile = _simulation.Map.WorldToTile(unit.Position);
-                view.ApplyFogState(_fog.IsVisible(tile.X, tile.Y));
+                view.ApplyFogState(CanSeeEnemyUnit(unit));
             }
         }
 
@@ -1352,8 +1376,7 @@ public partial class RtsGame : Node2D
 
                 if (unit.Side != GameSide.Player)
                 {
-                    var tile = _simulation.Map.WorldToTile(unit.Position);
-                    if (!_fog.IsVisible(tile.X, tile.Y))
+                    if (!CanSeeEnemyUnit(unit))
                     {
                         continue;
                     }
@@ -1538,8 +1561,7 @@ public partial class RtsGame : Node2D
 
             if (unit.Side != GameSide.Player)
             {
-                var tile = _simulation.Map.WorldToTile(unit.Position);
-                if (_fog is not null && !_fog.IsVisible(tile.X, tile.Y))
+                if (!CanSeeEnemyUnit(unit))
                 {
                     continue;
                 }
@@ -1686,7 +1708,98 @@ public partial class RtsGame : Node2D
         }
 
         var tile = _simulation.Map.WorldToTile(position);
+        if (_fog.IsVisible(tile.X, tile.Y))
+        {
+            return true;
+        }
+
+        if (!_debugModeEnabled)
+        {
+            return false;
+        }
+
+        foreach (var unit in _simulation.Units)
+        {
+            if (!unit.Alive || unit.Side == GameSide.Player)
+            {
+                continue;
+            }
+
+            if (unit.Position.DistanceTo(position) <= unit.Radius + 16f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool CanSeeEnemyUnit(SimUnit unit)
+    {
+        if (unit.Side == GameSide.Player)
+        {
+            return true;
+        }
+
+        if (_debugModeEnabled)
+        {
+            return true;
+        }
+
+        if (_simulation is null || _fog is null)
+        {
+            return false;
+        }
+
+        var tile = _simulation.Map.WorldToTile(unit.Position);
         return _fog.IsVisible(tile.X, tile.Y);
+    }
+
+    private void RefreshPresentationState()
+    {
+        if (!_isActive || _simulation is null || _fog is null)
+        {
+            _hud.UpdateDebugOverlay(false, string.Empty);
+            return;
+        }
+
+        SyncViews();
+        SyncHud();
+        _fogOverlayView.Refresh();
+        var mouseWorld = GetGlobalMousePosition();
+        var hoveredUnit = FindUnitAt(mouseWorld);
+        var hoveredBuilding = hoveredUnit is null ? FindBuildingAt(mouseWorld) : null;
+        var hoveredResource = FindResourceAt(mouseWorld);
+        _overlay.SyncState(_simulation, _placementKind, mouseWorld, _selectionStartWorld, _selectionCurrentWorld, hoveredUnit, hoveredBuilding, hoveredResource);
+    }
+
+    private void UpdateDebugOverlay(double delta, bool simulationAdvanced)
+    {
+        if (!_isActive)
+        {
+            _hud.UpdateDebugOverlay(false, string.Empty);
+            return;
+        }
+
+        if (simulationAdvanced)
+        {
+            _tickCounterWindow++;
+        }
+
+        _tickCounterWindowMs += delta * 1000d;
+        while (_tickCounterWindowMs >= 1000d)
+        {
+            _ticksPerSecond = _tickCounterWindow;
+            _tickCounterWindow = 0;
+            _tickCounterWindowMs -= 1000d;
+        }
+
+        var text = string.Format(
+            GameUiText.DebugOverlayFormat,
+            Engine.GetFramesPerSecond(),
+            _ticksPerSecond,
+            _simulationTickCount);
+        _hud.UpdateDebugOverlay(_debugModeEnabled, text);
     }
 
     private bool IsPointerOverHud()
