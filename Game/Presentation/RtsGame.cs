@@ -141,6 +141,8 @@ public partial class RtsGame : Node2D
             return;
         }
 
+        UpdateFog();
+        PushPlayerVisionSnapshot();
         _simulation.Update(delta);
         UpdateFog();
         UpdateCamera(delta);
@@ -283,10 +285,30 @@ public partial class RtsGame : Node2D
         ConfigureCamera();
         AutoSelectFirstWorker();
         UpdateFog();
+        PushPlayerVisionSnapshot();
         SyncViews();
         SyncHud();
         _isActive = true;
         _hud.ShowMessage(GameUiText.BattleStarted(init.PlayerRace, GameSettings.GetDifficulty(init.Difficulty).Label, init.AiProfile));
+    }
+
+    private void PushPlayerVisionSnapshot()
+    {
+        if (_simulation is null || _fog is null)
+        {
+            return;
+        }
+
+        var snapshot = new PlayerVisionSnapshot(_fog.Width, _fog.Height);
+        for (var y = 0; y < _fog.Height; y++)
+        {
+            for (var x = 0; x < _fog.Width; x++)
+            {
+                snapshot.SetVisible(x, y, _fog.IsVisible(x, y));
+            }
+        }
+
+        _simulation.UpdatePlayerVisionSnapshot(snapshot);
     }
 
     private void SubscribeSimulationEvents(GameSimulation simulation)

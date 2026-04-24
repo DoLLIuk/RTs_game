@@ -198,9 +198,9 @@
 - AI честный: использует sight и memory, а не прямое чтение всей карты
 - есть профили `Push` и `Harass`
 - сложности меняют качество решений и тайминги, а не доход
-- `Scout` теперь живет как отдельный non-combat recon-cycle: `ApproachEdge -> Peek -> BreakContact -> Reposition -> ReEnter`
-- во время `Scout` разведчик вообще не вступает в бой и играет только от выживания, кратких peeks и смены фланга
-- `Normal` и `Hard` чаще меняют сектор захода, а worker fallback разрешается только если есть безопасный вход/выход
+- `Scout` теперь живет как отдельный non-combat recon-cycle и на `Normal/Hard` использует frontier игрокового вижена как navigation-only input
+- scout не делает `peek` без обязательного `exit` и `fallback exit`, а route planner отбрасывает маршруты с длинной экспозицией внутри player vision
+- после проверки одного frontier-сектора scout обязан уходить наружу и переключаться на другой сектор, если есть валидная альтернатива
 - `Harass` теперь живет как отдельный raid-cycle: `Approach -> Raid -> Disengage -> Recover`
 - в раннем `Harass` AI предпочитает worker line, mines и outer buildings вместо тупого захода в `TownHall`
 - при явном преимуществе AI отзывает harass-группу и собирает полноценный push, а не пытается дожать базу маленьким рейдом
