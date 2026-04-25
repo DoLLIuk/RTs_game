@@ -217,11 +217,11 @@ public sealed partial class GameSimulation
 		var resolvedTarget = worldTarget;
 		var resolvedArrivalRadius = arrivalRadius;
 		var resolvedAnchor = interactionAnchor ?? worldTarget;
-		if (MovementTargetResolver.TryResolveOccupiedMoveTarget(unit, worldTarget, Units, Buildings, Resources, out var approachTarget, out var occupiedArrivalRadius, out var occupiedAnchor))
+		if (MovementTargetResolver.TryResolveOccupiedMoveZone(unit, worldTarget, Units, Buildings, Resources, out var occupiedZone))
 		{
-			resolvedTarget = approachTarget;
-			resolvedArrivalRadius = float.Max(resolvedArrivalRadius, occupiedArrivalRadius);
-			resolvedAnchor = occupiedAnchor;
+			resolvedTarget = occupiedZone.ZoneCenter;
+			resolvedArrivalRadius = float.Max(resolvedArrivalRadius, occupiedZone.ArrivalRadius);
+			resolvedAnchor = occupiedZone.InteractionAnchor;
 		}
 
 		unit.MoveInteractionAnchor = resolvedAnchor;
@@ -357,8 +357,8 @@ public sealed partial class GameSimulation
 		unit.ClearOrders();
 		unit.TargetBuilding = site;
 		unit.SaveWorkerBuildOrder(site);
-		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-		Repath(unit, StaticInteractionService.BuildApproachTarget(unit, site), arrivalRadius, interactionAnchor: site.Center);
+		var zone = StaticInteractionService.GetInteractionZone(unit, site);
+		Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 		unit.SetState(UnitState.Build);
 	}
 
@@ -375,8 +375,8 @@ public sealed partial class GameSimulation
 		}
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
-		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
+		var zone = MovementTargetResolver.GetWorkerReturnZone(unit, hall, unit.TargetResource);
+		Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
@@ -794,13 +794,15 @@ public sealed partial class GameSimulation
 
 		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, node))
 		{
+			if (TryAdvanceIntoInteractionRange(unit, node, delta))
+			{
+				return;
+			}
+
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(
-					unit,
-					MovementTargetResolver.GetWorkerGatherPathTarget(unit, node, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit)),
-					GetStaticApproachArrivalRadius(unit),
-					interactionAnchor: node.Center);
+				var zone = MovementTargetResolver.GetWorkerGatherZone(unit, node, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit));
+				Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -851,9 +853,15 @@ public sealed partial class GameSimulation
 
 		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, hall))
 		{
+			if (TryAdvanceIntoInteractionRange(unit, hall, delta))
+			{
+				return;
+			}
+
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), GetStaticApproachArrivalRadius(unit), interactionAnchor: hall.Center);
+				var zone = MovementTargetResolver.GetWorkerReturnZone(unit, hall, unit.TargetResource);
+				Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -907,9 +915,15 @@ public sealed partial class GameSimulation
 
 		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, site))
 		{
+			if (TryAdvanceIntoInteractionRange(unit, site, delta))
+			{
+				return;
+			}
+
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, StaticInteractionService.BuildApproachTarget(unit, site), GetStaticApproachArrivalRadius(unit), interactionAnchor: site.Center);
+				var zone = StaticInteractionService.GetInteractionZone(unit, site);
+				Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -1099,6 +1113,44 @@ public sealed partial class GameSimulation
 		return Mathf.Max(10f, unit.Radius * 0.75f);
 	}
 
+	private bool TryAdvanceIntoInteractionRange(SimUnit unit, SimBuilding building, double delta)
+	{
+		var approachThreshold = StaticInteractionService.GetInteractionClearance(unit) + GameConstants.TileSize * 1.1f;
+		if (StaticInteractionService.DistanceToFootprint(unit.Position, building.TilePosition, building.SizeTiles, building.SizeTiles) > approachThreshold)
+		{
+			return false;
+		}
+
+		var targetPoint = StaticInteractionService.GetClosestInteractionPoint(unit, unit.Position, building);
+		if (!_localMovementService.TryAdvanceToward(unit, targetPoint, delta, 0.45f))
+		{
+			return false;
+		}
+
+		unit.Path.Clear();
+		unit.PathRepathMs = 0d;
+		return true;
+	}
+
+	private bool TryAdvanceIntoInteractionRange(SimUnit unit, SimResourceNode resource, double delta)
+	{
+		var approachThreshold = StaticInteractionService.GetInteractionClearance(unit) + GameConstants.TileSize * 1.1f;
+		if (StaticInteractionService.DistanceToFootprint(unit.Position, resource.TilePosition, resource.TileWidth, resource.TileHeight) > approachThreshold)
+		{
+			return false;
+		}
+
+		var targetPoint = StaticInteractionService.GetClosestInteractionPoint(unit, unit.Position, resource);
+		if (!_localMovementService.TryAdvanceToward(unit, targetPoint, delta, 0.45f))
+		{
+			return false;
+		}
+
+		unit.Path.Clear();
+		unit.PathRepathMs = 0d;
+		return true;
+	}
+
 	private static float ScoreUnitTarget(SimUnit unit, SimUnit target, float distance)
 	{
 		var score = distance;
@@ -1223,8 +1275,8 @@ public sealed partial class GameSimulation
 
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
-		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
+		var zone = MovementTargetResolver.GetWorkerReturnZone(unit, hall, unit.TargetResource);
+		Repath(unit, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
@@ -1290,8 +1342,8 @@ public sealed partial class GameSimulation
 		worker.WorkerSafeCombatRadius = hall.Radius * GameConstants.WorkerSafeCombatHallRadiusMultiplier;
 		worker.WorkerCombatLeashRadius = hall.Radius * GameConstants.WorkerCombatLeashHallRadiusMultiplier;
 		worker.ReturnBuilding = hall;
-		var arrivalRadius = GetStaticApproachArrivalRadius(worker);
-		Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
+		var zone = MovementTargetResolver.GetWorkerReturnZone(worker, hall, worker.TargetResource);
+		Repath(worker, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 		worker.SetState(worker.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
 	}
 
@@ -1324,7 +1376,8 @@ public sealed partial class GameSimulation
 		{
 			if (worker.Path.Count == 0 || worker.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), GetStaticApproachArrivalRadius(worker), interactionAnchor: hall.Center);
+				var zone = MovementTargetResolver.GetWorkerReturnZone(worker, hall, worker.TargetResource);
+				Repath(worker, zone.ZoneCenter, zone.ArrivalRadius, interactionAnchor: zone.InteractionAnchor);
 			}
 
 			AdvanceWithRecovery(worker, delta);
@@ -1453,8 +1506,8 @@ public sealed partial class GameSimulation
 				{
 					worker.ClearOrders(false);
 					worker.TargetBuilding = site;
-					var buildArrivalRadius = GetStaticApproachArrivalRadius(worker);
-					Repath(worker, StaticInteractionService.BuildApproachTarget(worker, site), buildArrivalRadius, interactionAnchor: site.Center);
+					var buildZone = StaticInteractionService.GetInteractionZone(worker, site);
+					Repath(worker, buildZone.ZoneCenter, buildZone.ArrivalRadius, interactionAnchor: buildZone.InteractionAnchor);
 					worker.SetState(UnitState.Build);
 					return;
 				}
@@ -1469,8 +1522,8 @@ public sealed partial class GameSimulation
 					{
 						worker.ClearOrders(false);
 						worker.ReturnBuilding = hall;
-						var returnArrivalRadius = GetStaticApproachArrivalRadius(worker);
-						Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), returnArrivalRadius, interactionAnchor: hall.Center);
+						var returnZone = MovementTargetResolver.GetWorkerReturnZone(worker, hall, worker.TargetResource);
+						Repath(worker, returnZone.ZoneCenter, returnZone.ArrivalRadius, interactionAnchor: returnZone.InteractionAnchor);
 						worker.SetState(UnitState.ReturnCargo);
 						return;
 					}

@@ -183,25 +183,21 @@ public sealed class UnitPathService
 
         if (unit.TargetResource is { Alive: true } resource)
         {
-            var hall = unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : _findNearestHall(unit);
-            var target = MovementTargetResolver.GetWorkerGatherPathTarget(unit, resource, hall);
-            var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-            request = new PathRequest(target, arrivalRadius, resource.Center);
+            var zone = MovementTargetResolver.GetWorkerGatherZone(unit, resource, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : _findNearestHall(unit));
+            request = CreateZoneRequest(zone);
             return true;
         }
 
         if (unit.ReturnBuilding is { Alive: true } returnHall)
         {
-            var target = MovementTargetResolver.GetWorkerReturnPathTarget(unit, returnHall, unit.TargetResource);
-            var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-            request = new PathRequest(target, arrivalRadius, returnHall.Center);
+            var zone = MovementTargetResolver.GetWorkerReturnZone(unit, returnHall, unit.TargetResource);
+            request = CreateZoneRequest(zone);
             return true;
         }
 
         if (unit.TargetBuilding is { Alive: true } site)
         {
-            var arrivalRadius = GetStaticApproachArrivalRadius(unit);
-            request = new PathRequest(StaticInteractionService.BuildApproachTarget(unit, site), arrivalRadius, site.Center);
+            request = CreateZoneRequest(StaticInteractionService.GetInteractionZone(unit, site));
             return true;
         }
 
@@ -336,6 +332,12 @@ public sealed class UnitPathService
 
     private Dictionary<int, float> BuildDynamicPenaltyMap(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
     {
+        var hasCombatTarget = unit.TargetCombat is { Alive: true };
+        if (!stuckReroute && !hasCombatTarget)
+        {
+            return [];
+        }
+
         var penalty = new Dictionary<int, float>();
         var goalWorld = _map.TileToWorldCenter(goal.X, goal.Y);
         foreach (var other in _units)
@@ -355,7 +357,7 @@ public sealed class UnitPathService
             var nearGoal = Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack;
             var sharedCombatTarget = SharesCombatTarget(unit, other);
             var sharedMarchCohort = SharesMarchingCohort(unit, other);
-            if ((!nearGoal || !sharedCombatTarget) && !sharedMarchCohort)
+            if (hasCombatTarget && (!nearGoal || !sharedCombatTarget) && !sharedMarchCohort)
             {
                 AddTilePenalty(penalty, occupied.X, occupied.Y, sharedCombatTarget ? SoftUnitNeighborTilePenalty : SoftUnitTilePenalty);
                 for (var dy = -1; dy <= 1; dy++)
@@ -455,6 +457,11 @@ public sealed class UnitPathService
 
         request = new PathRequest(target.Value, 0f, target.Value);
         return true;
+    }
+
+    private static PathRequest CreateZoneRequest(InteractionZone zone)
+    {
+        return new PathRequest(zone.ZoneCenter, zone.ArrivalRadius, zone.InteractionAnchor);
     }
 
     private bool TryPromoteToTerminalFormation(SimUnit unit, double elapsedMs)

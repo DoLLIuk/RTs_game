@@ -10,6 +10,7 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 
 public sealed class LocalMovementService
 {
+    private const float SharedInteractionCompressionFactor = 0.48f;
     private readonly WorldTileMap _map;
     private readonly List<SimUnit> _units;
     private readonly List<SimBuilding> _buildings;
@@ -79,6 +80,11 @@ public sealed class LocalMovementService
             }
 
             var minimum = unit.Radius + other.Radius + padding;
+            if (AllowsSharedInteractionCompression(unit, other, candidate))
+            {
+                minimum *= SharedInteractionCompressionFactor;
+            }
+
             if (candidate.DistanceTo(other.Position) < minimum)
             {
                 return false;
@@ -146,6 +152,49 @@ public sealed class LocalMovementService
 
         unit.Position = candidate;
         return true;
+    }
+
+    public bool TryAdvanceToward(SimUnit unit, Vector2 targetPoint, double delta, float padding)
+    {
+        var toTarget = targetPoint - unit.Position;
+        var distance = toTarget.Length();
+        if (distance <= 0.05f)
+        {
+            return false;
+        }
+
+        var step = unit.Speed * (float)delta;
+        var direction = toTarget / distance;
+        var direct = unit.Position + direction * Mathf.Min(step, distance);
+        if (TryMoveToCandidate(unit, direct, padding))
+        {
+            unit.Position = direct;
+            return true;
+        }
+
+        var perpendicular = new Vector2(-direction.Y, direction.X);
+        var sideStep = Mathf.Clamp(step * 0.35f, 2f, GameConstants.LocalAvoidanceStep * 0.7f);
+        var offsets = new[]
+        {
+            direction * Mathf.Min(step * 0.7f, distance) + perpendicular * sideStep,
+            direction * Mathf.Min(step * 0.7f, distance) - perpendicular * sideStep,
+            perpendicular * sideStep,
+            -perpendicular * sideStep
+        };
+
+        foreach (var offset in offsets)
+        {
+            var candidate = unit.Position + offset;
+            if (!TryMoveToCandidate(unit, candidate, padding))
+            {
+                continue;
+            }
+
+            unit.Position = candidate;
+            return true;
+        }
+
+        return false;
     }
 
     private bool TrySteeredAdvance(SimUnit unit, Vector2 direction, float step)
@@ -238,6 +287,11 @@ public sealed class LocalMovementService
             }
 
             var minimum = unit.Radius + other.Radius + padding;
+            if (AllowsSharedInteractionCompression(unit, other, candidate))
+            {
+                minimum *= SharedInteractionCompressionFactor;
+            }
+
             var distance = candidate.DistanceTo(other.Position);
             if (distance >= minimum || distance >= bestDistance)
             {
@@ -292,6 +346,16 @@ public sealed class LocalMovementService
     private static bool AllowsCohortPassThrough(SimUnit unit, SimUnit other)
     {
         return SharesActiveMarchCohort(unit, other);
+    }
+
+    private static bool AllowsSharedInteractionCompression(SimUnit unit, SimUnit other, Vector2 candidate)
+    {
+        if (!TryGetSharedInteractionAnchor(unit, other, out var anchor, out var threshold))
+        {
+            return false;
+        }
+
+        return candidate.DistanceTo(anchor) <= threshold || unit.Position.DistanceTo(anchor) <= threshold;
     }
 
     private static float GetPreferredSteerSide(SimUnit unit, Vector2 direction, SimUnit? blocker)
@@ -373,6 +437,44 @@ public sealed class LocalMovementService
                second.State is UnitState.Move or UnitState.AttackMove &&
                !first.IsInTerminalFormation &&
                !second.IsInTerminalFormation;
+    }
+
+    private static bool TryGetSharedInteractionAnchor(SimUnit first, SimUnit second, out Vector2 anchor, out float threshold)
+    {
+        anchor = Vector2.Zero;
+        threshold = 0f;
+
+        if (first.TargetBuilding is { Alive: true } firstBuilding &&
+            second.TargetBuilding == firstBuilding &&
+            first.State == UnitState.Build &&
+            second.State == UnitState.Build)
+        {
+            anchor = firstBuilding.Center;
+            threshold = firstBuilding.Radius + GameConstants.TileSize * 1.45f;
+            return true;
+        }
+
+        if (first.TargetResource is { Alive: true } firstResource &&
+            second.TargetResource == firstResource &&
+            first.State == UnitState.Gather &&
+            second.State == UnitState.Gather)
+        {
+            anchor = firstResource.Center;
+            threshold = firstResource.Radius + GameConstants.TileSize * 1.35f;
+            return true;
+        }
+
+        if (first.ReturnBuilding is { Alive: true } firstHall &&
+            second.ReturnBuilding == firstHall &&
+            first.State == UnitState.ReturnCargo &&
+            second.State == UnitState.ReturnCargo)
+        {
+            anchor = firstHall.Center;
+            threshold = firstHall.Radius + GameConstants.TileSize * 1.45f;
+            return true;
+        }
+
+        return false;
     }
 
     private static bool IsMovingForward(SimUnit unit)

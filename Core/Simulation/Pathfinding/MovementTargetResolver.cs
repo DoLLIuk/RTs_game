@@ -12,15 +12,13 @@ public static class MovementTargetResolver
     private const float MoveTargetClickSlack = 10f;
     private const float MoveTargetStandOffPadding = 6f;
 
-    public static bool TryResolveOccupiedMoveTarget(
+    public static bool TryResolveOccupiedMoveZone(
         SimUnit unit,
         Vector2 worldTarget,
         IReadOnlyList<SimUnit> units,
         IReadOnlyList<SimBuilding> buildings,
         IReadOnlyList<SimResourceNode> resources,
-        out Vector2 resolvedTarget,
-        out float arrivalRadius,
-        out Vector2 interactionAnchor)
+        out InteractionZone zone)
     {
         foreach (var other in units)
         {
@@ -29,7 +27,7 @@ public static class MovementTargetResolver
                 continue;
             }
 
-            if (TryResolveOccupiedMoveTarget(unit, worldTarget, other.Position, other.Radius, out resolvedTarget, out arrivalRadius, out interactionAnchor))
+            if (TryResolveOccupiedMoveZone(unit, worldTarget, other.Position, other.Radius, out zone))
             {
                 return true;
             }
@@ -42,7 +40,7 @@ public static class MovementTargetResolver
                 continue;
             }
 
-            if (TryResolveOccupiedMoveTarget(unit, worldTarget, building.Center, building.Radius, out resolvedTarget, out arrivalRadius, out interactionAnchor))
+            if (TryResolveOccupiedMoveZone(unit, worldTarget, building.Center, building.Radius, out zone))
             {
                 return true;
             }
@@ -55,81 +53,43 @@ public static class MovementTargetResolver
                 continue;
             }
 
-            if (TryResolveOccupiedMoveTarget(unit, worldTarget, resource.Center, resource.Radius, out resolvedTarget, out arrivalRadius, out interactionAnchor))
+            if (TryResolveOccupiedMoveZone(unit, worldTarget, resource.Center, resource.Radius, out zone))
             {
                 return true;
             }
         }
 
-        resolvedTarget = worldTarget;
-        arrivalRadius = 0f;
-        interactionAnchor = worldTarget;
+        zone = default;
         return false;
     }
 
-    public static Vector2 GetWorkerGatherPathTarget(SimUnit unit, SimResourceNode node, SimBuilding? hall)
+    public static InteractionZone GetWorkerGatherZone(SimUnit unit, SimResourceNode node, SimBuilding? hall)
     {
-        if (!unit.IsWorker() || hall is null)
-        {
-            return StaticInteractionService.BuildApproachTarget(unit, node);
-        }
-
-        return TryBuildWorkerFlowTarget(
-                unit,
-                hall.Center,
-                hall.SizeTiles,
-                hall.SizeTiles,
-                node.Center,
-                node.TileWidth,
-                node.TileHeight,
-                approachingHall: false,
-                out var target)
-            ? target
-            : StaticInteractionService.BuildApproachTarget(unit, node);
+        return StaticInteractionService.GetInteractionZone(unit, node);
     }
 
-    public static Vector2 GetWorkerReturnPathTarget(SimUnit unit, SimBuilding hall, SimResourceNode? node)
+    public static InteractionZone GetWorkerReturnZone(SimUnit unit, SimBuilding hall, SimResourceNode? node)
     {
-        if (!unit.IsWorker() || node is not { Alive: true })
-        {
-            return StaticInteractionService.BuildApproachTarget(unit, hall);
-        }
-
-        return TryBuildWorkerFlowTarget(
-                unit,
-                hall.Center,
-                hall.SizeTiles,
-                hall.SizeTiles,
-                node.Center,
-                node.TileWidth,
-                node.TileHeight,
-                approachingHall: true,
-                out var target)
-            ? target
-            : StaticInteractionService.BuildApproachTarget(unit, hall);
+        return StaticInteractionService.GetInteractionZone(unit, hall);
     }
 
-    private static bool TryResolveOccupiedMoveTarget(
+    private static bool TryResolveOccupiedMoveZone(
         SimUnit unit,
         Vector2 worldTarget,
         Vector2 occupiedCenter,
         float occupiedRadius,
-        out Vector2 resolvedTarget,
-        out float arrivalRadius,
-        out Vector2 interactionAnchor)
+        out InteractionZone zone)
     {
         var detectionRadius = occupiedRadius + MoveTargetClickSlack;
         if (worldTarget.DistanceTo(occupiedCenter) > detectionRadius)
         {
-            resolvedTarget = worldTarget;
-            arrivalRadius = 0f;
-            interactionAnchor = worldTarget;
+            zone = default;
             return false;
         }
 
-        interactionAnchor = occupiedCenter;
-        arrivalRadius = occupiedRadius + unit.Radius + MoveTargetStandOffPadding;
-        resolvedTarget = BuildOccupiedMoveApproachPoint(unit, worldTarget, occupiedCenter, arrivalRadius);
+        var arrivalRadius = Mathf.Max(unit.Radius * 0.8f + 4f, GameConstants.TileSize * 0.42f);
+        var zoneCenter = BuildOccupiedMoveApproachPoint(unit, worldTarget, occupiedCenter, occupiedRadius + unit.Radius + MoveTargetStandOffPadding);
+        zone = new InteractionZone(zoneCenter, arrivalRadius, occupiedCenter);
         return true;
     }
 
@@ -149,50 +109,6 @@ public static class MovementTargetResolver
 
         outward = outward.Normalized();
         var lateral = new Vector2(-outward.Y, outward.X);
-        var lane = CombatApproachService.CenteredSlotIndex(Mathf.PosMod(unit.Id, 3));
-        var rank = Mathf.PosMod(unit.Id / 3, 2);
-        var laneSpacing = float.Max(unit.Radius * 1.25f + 2f, GameConstants.GroupSpacing * 0.28f);
-        var rankSpacing = float.Max(unit.Radius * 0.95f + 2f, GameConstants.GroupSpacing * 0.18f);
-        return anchor + outward * (arrivalRadius + rank * rankSpacing) + lateral * (lane * laneSpacing);
-    }
-
-    private static bool TryBuildWorkerFlowTarget(
-        SimUnit unit,
-        Vector2 hallCenter,
-        int hallWidthTiles,
-        int hallHeightTiles,
-        Vector2 nodeCenter,
-        int nodeWidthTiles,
-        int nodeHeightTiles,
-        bool approachingHall,
-        out Vector2 target)
-    {
-        var route = nodeCenter - hallCenter;
-        if (route.LengthSquared() <= 4f)
-        {
-            target = Vector2.Zero;
-            return false;
-        }
-
-        var routeDirection = route.Normalized();
-        var perpendicular = new Vector2(-routeDirection.Y, routeDirection.X);
-        var laneIndex = unit.Id % 5 - 2;
-        var laneOffset = perpendicular * (laneIndex * (GameConstants.WorkerFlowLaneOffset * 0.55f));
-        var interactionClearance = StaticInteractionService.GetInteractionClearance(unit);
-
-        if (approachingHall)
-        {
-            var depth = StaticInteractionService.GetDirectionalSupportDistance(routeDirection, hallWidthTiles, hallHeightTiles) +
-                        interactionClearance +
-                        Mathf.Abs(laneIndex) * 1.5f;
-            target = hallCenter + routeDirection * depth - laneOffset;
-            return true;
-        }
-
-        var depthToNode = StaticInteractionService.GetDirectionalSupportDistance(routeDirection, nodeWidthTiles, nodeHeightTiles) +
-                          interactionClearance +
-                          Mathf.Abs(laneIndex) * 1.2f;
-        target = nodeCenter - routeDirection * depthToNode + laneOffset;
-        return true;
+        return anchor + outward * arrivalRadius + lateral * (CombatApproachService.CenteredSlotIndex(Mathf.PosMod(unit.Id, 3)) * (unit.Radius * 0.35f + 2f));
     }
 }

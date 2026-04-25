@@ -48,60 +48,65 @@ public static class StaticInteractionService
         return Mathf.Abs(direction.X) * halfExtents.X + Mathf.Abs(direction.Y) * halfExtents.Y;
     }
 
-    public static Vector2 BuildApproachTarget(SimUnit unit, SimBuilding building)
+    public static InteractionZone GetInteractionZone(SimUnit unit, SimBuilding building)
     {
-        return BuildApproachTarget(unit, building.Center, building.TilePosition, building.SizeTiles, building.SizeTiles);
+        return BuildInteractionZone(unit, building.Center, building.TilePosition, building.SizeTiles, building.SizeTiles);
     }
 
-    public static Vector2 BuildApproachTarget(SimUnit unit, SimResourceNode resource)
+    public static InteractionZone GetInteractionZone(SimUnit unit, SimResourceNode resource)
     {
-        return BuildApproachTarget(unit, resource.Center, resource.TilePosition, resource.TileWidth, resource.TileHeight);
+        return BuildInteractionZone(unit, resource.Center, resource.TilePosition, resource.TileWidth, resource.TileHeight);
     }
 
-    private static Vector2 BuildApproachTarget(
+    public static Vector2 GetClosestInteractionPoint(SimUnit unit, Vector2 fromPoint, SimBuilding building)
+    {
+        return GetClosestInteractionPoint(unit, fromPoint, building.TilePosition, building.SizeTiles, building.SizeTiles);
+    }
+
+    public static Vector2 GetClosestInteractionPoint(SimUnit unit, Vector2 fromPoint, SimResourceNode resource)
+    {
+        return GetClosestInteractionPoint(unit, fromPoint, resource.TilePosition, resource.TileWidth, resource.TileHeight);
+    }
+
+    private static InteractionZone BuildInteractionZone(
         SimUnit unit,
         Vector2 center,
         Vector2I tilePosition,
         int widthTiles,
         int heightTiles)
     {
-        var relative = unit.Position - center;
-        if (relative.LengthSquared() <= 1f)
-        {
-            var fallbackAngle = Mathf.Tau * (Mathf.PosMod(unit.Id, 8) / 8f);
-            relative = new Vector2(Mathf.Cos(fallbackAngle), Mathf.Sin(fallbackAngle));
-        }
-
         var halfWidth = widthTiles * GameConstants.TileSize * 0.5f;
         var halfHeight = heightTiles * GameConstants.TileSize * 0.5f;
-        Vector2 normal;
-        Vector2 tangent;
-        float tangentHalfLength;
+        var clearance = GetInteractionClearance(unit);
+        var interactionRadius = Mathf.Max(halfWidth, halfHeight) + clearance * 0.82f;
+        return new InteractionZone(center, interactionRadius, center);
+    }
 
-        var normalizedX = halfWidth <= 0.01f ? 0f : Mathf.Abs(relative.X) / halfWidth;
-        var normalizedY = halfHeight <= 0.01f ? 0f : Mathf.Abs(relative.Y) / halfHeight;
-        if (normalizedX >= normalizedY)
+    private static Vector2 GetClosestInteractionPoint(
+        SimUnit unit,
+        Vector2 fromPoint,
+        Vector2I tilePosition,
+        int widthTiles,
+        int heightTiles)
+    {
+        var minX = tilePosition.X * GameConstants.TileSize;
+        var minY = tilePosition.Y * GameConstants.TileSize;
+        var maxX = minX + widthTiles * GameConstants.TileSize;
+        var maxY = minY + heightTiles * GameConstants.TileSize;
+        var closestX = Mathf.Clamp(fromPoint.X, minX, maxX);
+        var closestY = Mathf.Clamp(fromPoint.Y, minY, maxY);
+        var closest = new Vector2(closestX, closestY);
+        var outward = fromPoint - closest;
+        if (outward.LengthSquared() <= 0.01f)
         {
-            normal = relative.X >= 0f ? Vector2.Right : Vector2.Left;
-            tangent = Vector2.Down;
-            tangentHalfLength = halfHeight;
-        }
-        else
-        {
-            normal = relative.Y >= 0f ? Vector2.Down : Vector2.Up;
-            tangent = Vector2.Right;
-            tangentHalfLength = halfWidth;
+            var center = new Vector2((minX + maxX) * 0.5f, (minY + maxY) * 0.5f);
+            outward = fromPoint - center;
+            if (outward.LengthSquared() <= 0.01f)
+            {
+                outward = Vector2.Down;
+            }
         }
 
-        var lane = CombatApproachService.CenteredSlotIndex(Mathf.PosMod(unit.Id, 3));
-        var rank = Mathf.PosMod(unit.Id / 3, 2);
-        var laneSpacing = float.Max(unit.Radius * 1.15f + 2f, GameConstants.TileSize * 0.26f);
-        var rankSpacing = float.Max(unit.Radius * 0.8f, 2f);
-        var tangentSlack = float.Max(2f, unit.Radius * 0.2f);
-        var maxTangentOffset = float.Max(0f, tangentHalfLength - tangentSlack);
-        var tangentOffset = Mathf.Clamp(lane * laneSpacing, -maxTangentOffset, maxTangentOffset);
-        var supportDistance = GetDirectionalSupportDistance(normal, widthTiles, heightTiles);
-        var outwardOffset = supportDistance + GetInteractionClearance(unit) * 0.92f + rank * rankSpacing;
-        return center + normal * outwardOffset + tangent * tangentOffset;
+        return closest + outward.Normalized() * GetInteractionClearance(unit);
     }
 }
