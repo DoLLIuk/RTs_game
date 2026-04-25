@@ -11,12 +11,18 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 public sealed class LocalMovementService
 {
     private const float SharedInteractionCompressionFactor = 0.48f;
+    private const float DirectApproachSideStepFactor = 0.24f;
+    private const float DirectApproachMinSideStep = 1.25f;
+    private const float DirectApproachMaxSideStepFactor = 0.45f;
     private readonly WorldTileMap _map;
     private readonly List<SimUnit> _units;
     private readonly List<SimBuilding> _buildings;
     private readonly List<SimResourceNode> _resources;
-    private const float CompactSideStepFactor = 0.45f;
-    private const float CompactForwardBiasFactor = 0.2f;
+    private readonly UnitSpatialHash _unitSpatialHash;
+    private readonly List<SimUnit> _nearbyUnits = [];
+    private readonly float _maxUnitRadius;
+    private const float CompactSideStepFactor = 0.3f;
+    private const float CompactForwardBiasFactor = 0.16f;
 
     public LocalMovementService(WorldTileMap map, List<SimUnit> units, List<SimBuilding> buildings, List<SimResourceNode> resources)
     {
@@ -24,6 +30,18 @@ public sealed class LocalMovementService
         _units = units;
         _buildings = buildings;
         _resources = resources;
+        _unitSpatialHash = new UnitSpatialHash(GameConstants.TileSize * 2f);
+        _maxUnitRadius = 66f;
+    }
+
+    public void RebuildUnitIndex()
+    {
+        _unitSpatialHash.Rebuild(_units);
+    }
+
+    public void QueryNearbyUnits(Vector2 point, float radius, List<SimUnit> results)
+    {
+        _unitSpatialHash.Query(point, radius, results);
     }
 
     public bool AdvanceAlongPathWithSteering(SimUnit unit, double delta)
@@ -41,7 +59,7 @@ public sealed class LocalMovementService
         {
             if (TryMoveToCandidate(unit, next, 1.5f))
             {
-                unit.Position = next;
+                CommitMove(unit, next);
                 unit.Path.RemoveAt(0);
                 return unit.Path.Count > 0;
             }
@@ -53,7 +71,7 @@ public sealed class LocalMovementService
         var direct = unit.Position + direction * step;
         if (TryMoveToCandidate(unit, direct, 1.5f))
         {
-            unit.Position = direct;
+            CommitMove(unit, direct);
             return true;
         }
 
@@ -67,7 +85,9 @@ public sealed class LocalMovementService
             return false;
         }
 
-        foreach (var other in _units)
+        var queryRadius = unit.Radius + padding + _maxUnitRadius;
+        _unitSpatialHash.Query(candidate, queryRadius, _nearbyUnits);
+        foreach (var other in _nearbyUnits)
         {
             if (!other.Alive || other == unit || other == ignoredUnit)
             {
@@ -150,7 +170,7 @@ public sealed class LocalMovementService
             return false;
         }
 
-        unit.Position = candidate;
+        CommitMove(unit, candidate);
         return true;
     }
 
@@ -168,18 +188,22 @@ public sealed class LocalMovementService
         var direct = unit.Position + direction * Mathf.Min(step, distance);
         if (TryMoveToCandidate(unit, direct, padding))
         {
-            unit.Position = direct;
+            CommitMove(unit, direct);
             return true;
         }
 
         var perpendicular = new Vector2(-direction.Y, direction.X);
-        var sideStep = Mathf.Clamp(step * 0.35f, 2f, GameConstants.LocalAvoidanceStep * 0.7f);
+        var sideStep = Mathf.Clamp(
+            step * DirectApproachSideStepFactor,
+            DirectApproachMinSideStep,
+            GameConstants.LocalAvoidanceStep * DirectApproachMaxSideStepFactor);
+        var forwardStep = direction * Mathf.Min(step * 0.82f, distance);
         var offsets = new[]
         {
-            direction * Mathf.Min(step * 0.7f, distance) + perpendicular * sideStep,
-            direction * Mathf.Min(step * 0.7f, distance) - perpendicular * sideStep,
-            perpendicular * sideStep,
-            -perpendicular * sideStep
+            forwardStep + perpendicular * sideStep,
+            forwardStep - perpendicular * sideStep,
+            direction * Mathf.Min(step * 0.55f, distance) + perpendicular * (sideStep * 0.65f),
+            direction * Mathf.Min(step * 0.55f, distance) - perpendicular * (sideStep * 0.65f)
         };
 
         foreach (var offset in offsets)
@@ -190,7 +214,7 @@ public sealed class LocalMovementService
                 continue;
             }
 
-            unit.Position = candidate;
+            CommitMove(unit, candidate);
             return true;
         }
 
@@ -225,12 +249,13 @@ public sealed class LocalMovementService
 
         var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
         var perpendicular = new Vector2(-direction.Y, direction.X);
-        var sideStep = Mathf.Clamp(step * CompactSideStepFactor, 2f, GameConstants.LocalAvoidanceStep * 0.8f);
+        var sideStep = Mathf.Clamp(step * CompactSideStepFactor, 1.2f, GameConstants.LocalAvoidanceStep * 0.55f);
         var forwardBias = direction * Mathf.Min(step * CompactForwardBiasFactor, sideStep * 0.6f);
         var offsets = new[]
         {
             forwardBias + perpendicular * preferredSide * sideStep,
-            forwardBias - perpendicular * preferredSide * sideStep
+            forwardBias - perpendicular * preferredSide * sideStep,
+            direction * Mathf.Min(step * 0.45f, sideStep * 0.5f) + perpendicular * preferredSide * (sideStep * 0.55f)
         };
 
         foreach (var offset in offsets)
@@ -241,7 +266,7 @@ public sealed class LocalMovementService
                 continue;
             }
 
-            unit.Position = candidate;
+            CommitMove(unit, candidate);
             return true;
         }
 
@@ -274,7 +299,9 @@ public sealed class LocalMovementService
     {
         SimUnit? best = null;
         var bestDistance = float.PositiveInfinity;
-        foreach (var other in _units)
+        var queryRadius = unit.Radius + padding + _maxUnitRadius;
+        _unitSpatialHash.Query(candidate, queryRadius, _nearbyUnits);
+        foreach (var other in _nearbyUnits)
         {
             if (!other.Alive || other == unit)
             {
@@ -320,7 +347,7 @@ public sealed class LocalMovementService
             return false;
         }
 
-        unit.Position = candidate;
+        CommitMove(unit, candidate);
         return true;
     }
 
@@ -356,6 +383,13 @@ public sealed class LocalMovementService
         }
 
         return candidate.DistanceTo(anchor) <= threshold || unit.Position.DistanceTo(anchor) <= threshold;
+    }
+
+    public void CommitMove(SimUnit unit, Vector2 newPosition)
+    {
+        var oldPosition = unit.Position;
+        unit.Position = newPosition;
+        _unitSpatialHash.UpdateUnit(unit, oldPosition, newPosition);
     }
 
     private static float GetPreferredSteerSide(SimUnit unit, Vector2 direction, SimUnit? blocker)

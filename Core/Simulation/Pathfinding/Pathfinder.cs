@@ -1,3 +1,4 @@
+using System.Buffers;
 using System;
 using System.Collections.Generic;
 using Godot;
@@ -45,81 +46,92 @@ public static class Pathfinder
             }
         }
 
-        var goalKeys = new HashSet<int>();
+        var goalKeys = new List<int>(actualGoals.Count);
         foreach (var actualGoal in actualGoals)
         {
             goalKeys.Add(Key(actualGoal.X, actualGoal.Y));
         }
 
-        if (allowStartAsGoal && goalKeys.Contains(Key(start.X, start.Y)))
+        if (allowStartAsGoal && ContainsGoalKey(goalKeys, Key(start.X, start.Y)))
         {
             return [];
         }
 
+        var mapCellCount = GameConstants.MapWidth * GameConstants.MapHeight;
         var startKey = Key(start.X, start.Y);
-        var parent = new int[GameConstants.MapWidth * GameConstants.MapHeight];
-        var gScore = new float[parent.Length];
-        var closed = new bool[parent.Length];
-        Array.Fill(parent, -1);
-        Array.Fill(gScore, float.PositiveInfinity);
+        var parent = ArrayPool<int>.Shared.Rent(mapCellCount);
+        var gScore = ArrayPool<float>.Shared.Rent(mapCellCount);
+        var closed = ArrayPool<bool>.Shared.Rent(mapCellCount);
+        Array.Fill(parent, -1, 0, mapCellCount);
+        Array.Fill(gScore, float.PositiveInfinity, 0, mapCellCount);
+        Array.Clear(closed, 0, mapCellCount);
 
-        var open = new PriorityQueue<int, float>();
-        gScore[startKey] = 0f;
-        open.Enqueue(startKey, Heuristic(start, actualGoals));
-
-        var iterations = 0;
-        while (open.Count > 0)
+        try
         {
-            if (++iterations > 4000)
-            {
-                break;
-            }
+            var open = new PriorityQueue<int, float>();
+            gScore[startKey] = 0f;
+            open.Enqueue(startKey, Heuristic(start, actualGoals));
 
-            var currentKey = open.Dequeue();
-            if (closed[currentKey])
+            var iterations = 0;
+            while (open.Count > 0)
             {
-                continue;
-            }
+                if (++iterations > 4000)
+                {
+                    break;
+                }
 
-            closed[currentKey] = true;
-            var current = FromKey(currentKey);
-
-            if (goalKeys.Contains(currentKey))
-            {
-                return Reconstruct(parent, currentKey);
-            }
-
-            for (var offset = 0; offset < Directions.Length; offset++)
-            {
-                var direction = Directions[(offset + tieBreakerSeed) % Directions.Length];
-                var nx = current.X + direction.Dx;
-                var ny = current.Y + direction.Dy;
-                var nextKey = Key(nx, ny);
-                if (!map.InBounds(nx, ny) || closed[nextKey] || !map.IsWalkable(nx, ny))
+                var currentKey = open.Dequeue();
+                if (closed[currentKey])
                 {
                     continue;
                 }
 
-                if (direction.Dx != 0 && direction.Dy != 0 &&
-                    (!map.IsWalkable(current.X + direction.Dx, current.Y) || !map.IsWalkable(current.X, current.Y + direction.Dy)))
+                closed[currentKey] = true;
+                var current = FromKey(currentKey);
+
+                if (ContainsGoalKey(goalKeys, currentKey))
                 {
-                    continue;
+                    return Reconstruct(parent, currentKey);
                 }
 
-                var g = gScore[currentKey] + direction.Cost + GetTilePenalty(tilePenalty, nx, ny) * PenaltyWeight;
-                if (g >= gScore[nextKey])
+                for (var offset = 0; offset < Directions.Length; offset++)
                 {
-                    continue;
-                }
+                    var direction = Directions[(offset + tieBreakerSeed) % Directions.Length];
+                    var nx = current.X + direction.Dx;
+                    var ny = current.Y + direction.Dy;
+                    var nextKey = Key(nx, ny);
+                    if (!map.InBounds(nx, ny) || closed[nextKey] || !map.IsWalkable(nx, ny))
+                    {
+                        continue;
+                    }
 
-                parent[nextKey] = currentKey;
-                gScore[nextKey] = g;
-                var f = g + Heuristic(new Vector2I(nx, ny), actualGoals) + TieBreaker(new Vector2I(nx, ny), tieBreakerSeed) * 0.001f;
-                open.Enqueue(nextKey, f);
+                    if (direction.Dx != 0 && direction.Dy != 0 &&
+                        (!map.IsWalkable(current.X + direction.Dx, current.Y) || !map.IsWalkable(current.X, current.Y + direction.Dy)))
+                    {
+                        continue;
+                    }
+
+                    var g = gScore[currentKey] + direction.Cost + GetTilePenalty(tilePenalty, nx, ny) * PenaltyWeight;
+                    if (g >= gScore[nextKey])
+                    {
+                        continue;
+                    }
+
+                    parent[nextKey] = currentKey;
+                    gScore[nextKey] = g;
+                    var f = g + Heuristic(new Vector2I(nx, ny), actualGoals) + TieBreaker(new Vector2I(nx, ny), tieBreakerSeed) * 0.001f;
+                    open.Enqueue(nextKey, f);
+                }
             }
+
+            return [];
         }
-
-        return [];
+        finally
+        {
+            ArrayPool<int>.Shared.Return(parent, clearArray: false);
+            ArrayPool<float>.Shared.Return(gScore, clearArray: false);
+            ArrayPool<bool>.Shared.Return(closed, clearArray: true);
+        }
     }
 
     private static List<Vector2I> FindGoalCandidates(
@@ -182,10 +194,24 @@ public static class Pathfinder
         var result = new List<Vector2I>();
         for (var current = endKey; parent[current] >= 0; current = parent[current])
         {
-            result.Insert(0, FromKey(current));
+            result.Add(FromKey(current));
         }
 
+        result.Reverse();
         return result;
+    }
+
+    private static bool ContainsGoalKey(List<int> goalKeys, int key)
+    {
+        for (var index = 0; index < goalKeys.Count; index++)
+        {
+            if (goalKeys[index] == key)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static Vector2I? FindNearestWalkable(WorldTileMap map, Vector2I goal)

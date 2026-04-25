@@ -45,6 +45,7 @@ public sealed partial class GameSimulation
 	private double _elapsedMs;
 	private double _aiTickAccumMs;
 	private int _nextMovementCohortId = 1;
+	private bool _unitIndexDirty = true;
 	private readonly DifficultyDefinition _difficultyDefinition;
 	private PlayerVisionSnapshot? _playerVisionSnapshot;
 	private AiState _aiState = AiState.Open;
@@ -117,6 +118,11 @@ public sealed partial class GameSimulation
 		var deltaMs = delta * 1000d;
 		_elapsedMs += deltaMs;
 		_aiTickAccumMs += deltaMs;
+		if (_unitIndexDirty)
+		{
+			_localMovementService.RebuildUnitIndex();
+			_unitIndexDirty = false;
+		}
 
 		foreach (var unit in Units)
 		{
@@ -596,6 +602,7 @@ public sealed partial class GameSimulation
 	{
 		var unit = new SimUnit(_nextEntityId++, kind, side, race, position);
 		Units.Add(unit);
+		_unitIndexDirty = true;
 		Economy.AddFood(side, unit.Food);
 		UnitProduced?.Invoke(position, side);
 		return unit;
@@ -1655,6 +1662,7 @@ public sealed partial class GameSimulation
 
 	private void PruneDead()
 	{
+		var removedAnyUnit = false;
 		Units.RemoveAll(unit =>
 		{
 			if (unit.Alive)
@@ -1663,8 +1671,13 @@ public sealed partial class GameSimulation
 			}
 
 			Economy.RemoveFood(unit.Side, unit.Food);
+			removedAnyUnit = true;
 			return true;
 		});
+		if (removedAnyUnit)
+		{
+			_unitIndexDirty = true;
+		}
 
 		Buildings.RemoveAll(building =>
 		{

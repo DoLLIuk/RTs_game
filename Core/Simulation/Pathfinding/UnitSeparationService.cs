@@ -8,8 +8,11 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 
 public sealed class UnitSeparationService
 {
+    private const float SharedInteractionSeparationFactor = 0.55f;
     private readonly List<SimUnit> _units;
     private readonly LocalMovementService _localMovement;
+    private readonly List<SimUnit> _nearbyUnits = [];
+    private const float SeparationQueryPadding = 70f;
 
     public UnitSeparationService(List<SimUnit> units, LocalMovementService localMovement)
     {
@@ -19,7 +22,7 @@ public sealed class UnitSeparationService
 
     public void ApplySeparation(double delta)
     {
-        var strength = Math.Min(1d, delta / 0.01667d) * 0.55d;
+        var strength = Math.Min(1d, delta / 0.01667d) * 0.4d;
         for (var i = 0; i < _units.Count; i++)
         {
             var first = _units[i];
@@ -28,10 +31,10 @@ public sealed class UnitSeparationService
                 continue;
             }
 
-            for (var j = i + 1; j < _units.Count; j++)
+            _localMovement.QueryNearbyUnits(first.Position, first.Radius + SeparationQueryPadding, _nearbyUnits);
+            foreach (var second in _nearbyUnits)
             {
-                var second = _units[j];
-                if (!second.Alive || second.Side != first.Side)
+                if (!second.Alive || second.Side != first.Side || second.Id <= first.Id)
                 {
                     continue;
                 }
@@ -55,12 +58,25 @@ public sealed class UnitSeparationService
                 }
 
                 var overlap = minimum - distance;
-                if (overlap <= 0.2f)
+                if (overlap <= 0.3f)
                 {
                     continue;
                 }
 
-                var push = Mathf.Clamp((float)(overlap * 0.35f * strength), 0.2f, 1.4f);
+                var softOverlap = Mathf.Max(0f, overlap - 0.18f);
+                if (softOverlap <= 0.01f)
+                {
+                    continue;
+                }
+
+                var pushFactor = TryGetSharedInteractionAnchor(first, second, out _, out _) ?
+                    SharedInteractionSeparationFactor :
+                    1f;
+                var overlapPressure = Mathf.Clamp(softOverlap / (minimum * 0.45f), 0f, 1f);
+                var push = Mathf.Clamp(
+                    (float)(softOverlap * (0.12f + overlapPressure * 0.09f) * strength * pushFactor),
+                    0.06f,
+                    0.8f);
                 var normal = deltaVector / distance;
                 TryNudge(first, -normal * push, second);
                 TryNudge(second, normal * push, first);
@@ -202,6 +218,44 @@ public sealed class UnitSeparationService
                firstDirection.Dot(secondDirection) >= 0.65f;
     }
 
+    private static bool TryGetSharedInteractionAnchor(SimUnit first, SimUnit second, out Vector2 anchor, out float threshold)
+    {
+        anchor = Vector2.Zero;
+        threshold = 0f;
+
+        if (first.TargetBuilding is { Alive: true } firstBuilding &&
+            second.TargetBuilding == firstBuilding &&
+            first.State == UnitState.Build &&
+            second.State == UnitState.Build)
+        {
+            anchor = firstBuilding.Center;
+            threshold = firstBuilding.Radius + GameConstants.TileSize * 1.45f;
+            return true;
+        }
+
+        if (first.TargetResource is { Alive: true } firstResource &&
+            second.TargetResource == firstResource &&
+            first.State == UnitState.Gather &&
+            second.State == UnitState.Gather)
+        {
+            anchor = firstResource.Center;
+            threshold = firstResource.Radius + GameConstants.TileSize * 1.35f;
+            return true;
+        }
+
+        if (first.ReturnBuilding is { Alive: true } firstHall &&
+            second.ReturnBuilding == firstHall &&
+            first.State == UnitState.ReturnCargo &&
+            second.State == UnitState.ReturnCargo)
+        {
+            anchor = firstHall.Center;
+            threshold = firstHall.Radius + GameConstants.TileSize * 1.45f;
+            return true;
+        }
+
+        return false;
+    }
+
     private void TryNudge(SimUnit unit, Vector2 offset, SimUnit? ignoredUnit = null)
     {
         var next = unit.Position + offset;
@@ -210,6 +264,6 @@ public sealed class UnitSeparationService
             return;
         }
 
-        unit.Position = next;
+        _localMovement.CommitMove(unit, next);
     }
 }
