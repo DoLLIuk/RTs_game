@@ -78,6 +78,7 @@ public sealed partial class GameSimulation
 		_aiStateEnteredMs = 0d;
 		_aiKnowledge = new AiKnowledgeService(CreateAiKnowledgeContext());
 		_aiArmyManager = new AiArmyManager(CreateAiArmyManagerContext());
+		_aiEconomyPlanner = new AiEconomyPlanner(CreateAiEconomyPlannerContext());
 		_harassMissionService = new HarassMissionService(CreateHarassMissionContext());
 		_scoutSystem = new ScoutSystem(CreateScoutContext());
 
@@ -2420,7 +2421,7 @@ public sealed partial class GameSimulation
 		}
 
 		_aiKnowledge.Update(units, buildings);
-		AssignIdleWorkers(workers);
+		_aiEconomyPlanner.AssignIdleWorkers(workers);
 		var hasBarracks = buildings.Exists(building => building.Kind == BuildingKind.Barracks && building.Completed);
 		var hasWorkshop = buildings.Exists(building => building.Kind == BuildingKind.Workshop && building.Completed);
 		var barracks = buildings.Find(building => building.Kind == BuildingKind.Barracks && building.Completed);
@@ -2477,7 +2478,7 @@ public sealed partial class GameSimulation
 			_harassMissionService.Reset(preserveHistory: true);
 		}
 
-		MaintainAiEconomy(
+		_aiEconomyPlanner.Maintain(
 			hall,
 			workers,
 			buildings,
@@ -2490,237 +2491,6 @@ public sealed partial class GameSimulation
 			workshop);
 		ExecuteAiState(hall, suspectedBase, army, mainArmy, mainMetrics, harassSquad, harassMetrics, pressure);
 		ApplyAiMicro(mainArmy, mainMetrics, harassSquad, harassMetrics, hall, pressure);
-	}
-
-	private void AssignIdleWorkers(List<SimUnit> workers)
-	{
-		var goldWorkers = 0;
-		var lumberWorkers = 0;
-		foreach (var worker in workers)
-		{
-			if (worker.TargetResource?.Type == ResourceType.Gold)
-			{
-				goldWorkers++;
-			}
-			else if (worker.TargetResource?.Type == ResourceType.Lumber)
-			{
-				lumberWorkers++;
-			}
-		}
-
-		foreach (var worker in workers)
-		{
-			if (worker.State != UnitState.Idle && !(worker.State == UnitState.Gather && worker.TargetResource is null))
-			{
-				continue;
-			}
-
-			var type = goldWorkers < lumberWorkers + 2 ? ResourceType.Gold : ResourceType.Lumber;
-			var resource = FindNearestResource(worker, type) ?? FindNearestResource(worker, type == ResourceType.Gold ? ResourceType.Lumber : ResourceType.Gold);
-			if (resource is null)
-			{
-				continue;
-			}
-
-			IssueGather(worker, resource);
-			if (resource.Type == ResourceType.Gold)
-			{
-				goldWorkers++;
-			}
-			else
-			{
-				lumberWorkers++;
-			}
-		}
-	}
-
-	private bool TryBuildAi(BuildingKind kind, SimBuilding hall, List<SimUnit> workers, int preferredRadius)
-	{
-		if (workers.Count == 0)
-		{
-			return false;
-		}
-
-		var spot = FindBuildSpot(kind, hall, preferredRadius);
-		if (!spot.HasValue || !TryStartBuilding(GameSide.AI, AIRace, kind, spot.Value, out var building) || building is null)
-		{
-			return false;
-		}
-
-		var worker = workers.Find(candidate => candidate.State is UnitState.Gather or UnitState.Idle) ?? workers[0];
-		IssueBuild(worker, building);
-		return true;
-	}
-
-	private Vector2I? FindBuildSpot(BuildingKind kind, SimBuilding hall, int preferredRadius)
-	{
-		var center = hall.CenterTile();
-		for (var radius = preferredRadius; radius < 15; radius++)
-		{
-			for (var dy = -radius; dy <= radius; dy++)
-			{
-				for (var dx = -radius; dx <= radius; dx++)
-				{
-					if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
-					{
-						continue;
-					}
-
-					var tx = center.X + dx;
-					var ty = center.Y + dy;
-					if (CanPlaceBuilding(kind, new Vector2I(tx, ty)))
-					{
-						return new Vector2I(tx, ty);
-					}
-				}
-			}
-		}
-
-		return null;
-	}
-
-	private bool IsBuildingUnderConstruction(BuildingKind kind)
-	{
-		return Buildings.Exists(building => building.Alive && building.Side == GameSide.AI && building.Kind == kind && !building.Completed);
-	}
-
-	private bool NearbyTower(List<SimBuilding> buildings, SimBuilding hall)
-	{
-		return buildings.Exists(building => building.Kind == BuildingKind.Tower && building.Center.DistanceTo(hall.Center) < GameConstants.TileSize * 10f);
-	}
-
-	private void MaintainAiEconomy(
-		SimBuilding hall,
-		List<SimUnit> workers,
-		List<SimBuilding> buildings,
-		PlayerState economy,
-		bool hasBarracks,
-		bool hasWorkshop,
-		bool pressure,
-		AiSquadMetrics mainMetrics,
-		SimBuilding? barracks,
-		SimBuilding? workshop)
-	{
-		if (economy.Food + 3 >= economy.FoodCap && !IsBuildingUnderConstruction(BuildingKind.Farm))
-		{
-			TryBuildAi(BuildingKind.Farm, hall, workers, 4);
-		}
-
-		if (workers.Count < _difficultyDefinition.TargetWorkers && hall.Queue.Count < 2)
-		{
-			TryQueueUnit(hall, UnitKind.Worker);
-		}
-
-		if (!hasBarracks && workers.Count >= 4 && !IsBuildingUnderConstruction(BuildingKind.Barracks))
-		{
-			TryBuildAi(BuildingKind.Barracks, hall, workers, 5);
-		}
-
-		if (hasBarracks && !hasWorkshop && workers.Count >= 7 && mainMetrics.Power >= 4f && !IsBuildingUnderConstruction(BuildingKind.Workshop))
-		{
-			TryBuildAi(BuildingKind.Workshop, hall, workers, 6);
-		}
-
-		if (pressure && !NearbyTower(buildings, hall) && !IsBuildingUnderConstruction(BuildingKind.Tower))
-		{
-			TryBuildAi(BuildingKind.Tower, hall, workers, 5);
-		}
-
-		var facing = (GetAiPrimaryTargetPosition() - hall.Center).Normalized();
-		if (facing.LengthSquared() <= 0.01f)
-		{
-			facing = Vector2.Left;
-		}
-
-		if (barracks is not null && barracks.Queue.Count < 2)
-		{
-			var pick = PickBarracksUnit(hasWorkshop);
-			if (pick.HasValue)
-			{
-				TryQueueUnit(barracks, pick.Value);
-			}
-
-			barracks.RallyPoint = hall.Center + facing * 94f;
-		}
-
-		if (workshop is not null && workshop.Queue.Count < 1 && ShouldBuildSiege(mainMetrics))
-		{
-			TryQueueUnit(workshop, UnitKind.Catapult);
-			workshop.RallyPoint = hall.Center + facing * 124f + new Vector2(-facing.Y, facing.X) * 28f;
-		}
-	}
-
-	private bool ShouldBuildSiege(AiSquadMetrics mainMetrics)
-	{
-		if (_aiKnowledge.KnownBuildingCount == 0)
-		{
-			return mainMetrics.Power >= _difficultyDefinition.PushMinPower + 2f;
-		}
-
-		foreach (var building in _aiKnowledge.KnownBuildings)
-		{
-			if (building.Kind is BuildingKind.Tower or BuildingKind.Barracks or BuildingKind.Workshop)
-			{
-				return true;
-			}
-		}
-
-		return mainMetrics.SiegeCount == 0 && mainMetrics.Power >= _difficultyDefinition.PushMinPower + 1f;
-	}
-
-	private UnitKind? PickBarracksUnit(bool hasWorkshop)
-	{
-		var economy = Economy.Get(GameSide.AI);
-		var archers = 0;
-		var footmen = 0;
-		var knights = 0;
-
-		foreach (var unit in Units)
-		{
-			if (!unit.Alive || unit.Side != GameSide.AI || unit.Kind == UnitKind.Worker)
-			{
-				continue;
-			}
-
-			switch (unit.Kind)
-			{
-				case UnitKind.Archer:
-					archers++;
-					break;
-				case UnitKind.Footman:
-					footmen++;
-					break;
-				case UnitKind.Knight:
-					knights++;
-					break;
-			}
-		}
-
-		if (hasWorkshop && knights < 3 && economy.Gold >= GameDefinitions.Units[UnitKind.Knight].CostGold && economy.Lumber >= GameDefinitions.Units[UnitKind.Knight].CostLumber)
-		{
-			return UnitKind.Knight;
-		}
-
-		if (Init.AiProfile == AiProfile.Harass &&
-			hasWorkshop &&
-			knights < 2 &&
-			economy.Gold >= GameDefinitions.Units[UnitKind.Knight].CostGold &&
-			economy.Lumber >= GameDefinitions.Units[UnitKind.Knight].CostLumber)
-		{
-			return UnitKind.Knight;
-		}
-
-		if (archers < footmen && economy.Gold >= GameDefinitions.Units[UnitKind.Archer].CostGold && economy.Lumber >= GameDefinitions.Units[UnitKind.Archer].CostLumber)
-		{
-			return UnitKind.Archer;
-		}
-
-		if (economy.Gold >= GameDefinitions.Units[UnitKind.Footman].CostGold)
-		{
-			return UnitKind.Footman;
-		}
-
-		return null;
 	}
 
 	private void ExecuteAiState(
