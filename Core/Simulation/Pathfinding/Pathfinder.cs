@@ -9,6 +9,7 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 
 public static class Pathfinder
 {
+    private const float PenaltyWeight = 0.45f;
     private static readonly (int Dx, int Dy, float Cost)[] Directions =
     [
         (1, 0, 1f), (-1, 0, 1f), (0, 1, 1f), (0, -1, 1f),
@@ -105,7 +106,7 @@ public static class Pathfinder
                     continue;
                 }
 
-                var g = gScore[currentKey] + direction.Cost + GetTilePenalty(tilePenalty, nx, ny);
+                var g = gScore[currentKey] + direction.Cost + GetTilePenalty(tilePenalty, nx, ny) * PenaltyWeight;
                 if (g >= gScore[nextKey])
                 {
                     continue;
@@ -148,7 +149,7 @@ public static class Pathfinder
                     }
 
                     var penalty = GetTilePenalty(tilePenalty, next.X, next.Y);
-                    var score = goal.DistanceSquaredTo(next) + penalty + TieBreaker(next, tieBreakerSeed);
+                    var score = goal.DistanceSquaredTo(next) + penalty * PenaltyWeight + TieBreaker(next, tieBreakerSeed);
                     candidates.Add((next, score));
                 }
             }
@@ -166,7 +167,7 @@ public static class Pathfinder
         }
 
         candidates.Sort(static (left, right) => left.Score.CompareTo(right.Score));
-        var limit = int.Min(6, candidates.Count);
+        var limit = int.Min(10, candidates.Count);
         var result = new List<Vector2I>(limit);
         for (var i = 0; i < limit; i++)
         {

@@ -14,6 +14,7 @@ internal sealed class HarassMissionContext
     private readonly Func<Vector2, Vector2, Vector2> _findAssaultApproachPoint;
     private readonly Func<List<SimUnit>, AiSquadMetrics> _calculateMetrics;
     private readonly Action<SimUnit, Vector2> _commandUnitMove;
+    private readonly Action<IReadOnlyList<SimUnit>, IReadOnlyList<Vector2>, Vector2> _commandUnitMoveGroup;
     private readonly Action<SimUnit, ICombatTarget> _issueAttack;
 
     public HarassMissionContext(
@@ -26,6 +27,7 @@ internal sealed class HarassMissionContext
         Func<Vector2, Vector2, Vector2> findAssaultApproachPoint,
         Func<List<SimUnit>, AiSquadMetrics> calculateMetrics,
         Action<SimUnit, Vector2> commandUnitMove,
+        Action<IReadOnlyList<SimUnit>, IReadOnlyList<Vector2>, Vector2> commandUnitMoveGroup,
         Action<SimUnit, ICombatTarget> issueAttack)
     {
         Map = map;
@@ -37,6 +39,7 @@ internal sealed class HarassMissionContext
         _findAssaultApproachPoint = findAssaultApproachPoint;
         _calculateMetrics = calculateMetrics;
         _commandUnitMove = commandUnitMove;
+        _commandUnitMoveGroup = commandUnitMoveGroup;
         _issueAttack = issueAttack;
     }
 
@@ -60,6 +63,11 @@ internal sealed class HarassMissionContext
     public void CommandUnitMove(SimUnit unit, Vector2 destination)
     {
         _commandUnitMove(unit, destination);
+    }
+
+    public void CommandUnitMoveGroup(IReadOnlyList<SimUnit> units, IReadOnlyList<Vector2> destinations, Vector2 sharedTarget)
+    {
+        _commandUnitMoveGroup(units, destinations, sharedTarget);
     }
 
     public void IssueAttack(SimUnit unit, ICombatTarget target)

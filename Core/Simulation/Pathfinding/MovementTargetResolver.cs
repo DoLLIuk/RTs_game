@@ -10,7 +10,7 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 public static class MovementTargetResolver
 {
     private const float MoveTargetClickSlack = 10f;
-    private const float MoveTargetStandOffPadding = 12f;
+    private const float MoveTargetStandOffPadding = 6f;
 
     public static bool TryResolveOccupiedMoveTarget(
         SimUnit unit,
@@ -71,24 +71,42 @@ public static class MovementTargetResolver
     {
         if (!unit.IsWorker() || hall is null)
         {
-            return node.Center;
+            return StaticInteractionService.BuildApproachTarget(unit, node);
         }
 
-        return TryBuildWorkerFlowTarget(unit.Id, hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: false, out var target)
+        return TryBuildWorkerFlowTarget(
+                unit,
+                hall.Center,
+                hall.SizeTiles,
+                hall.SizeTiles,
+                node.Center,
+                node.TileWidth,
+                node.TileHeight,
+                approachingHall: false,
+                out var target)
             ? target
-            : node.Center;
+            : StaticInteractionService.BuildApproachTarget(unit, node);
     }
 
     public static Vector2 GetWorkerReturnPathTarget(SimUnit unit, SimBuilding hall, SimResourceNode? node)
     {
         if (!unit.IsWorker() || node is not { Alive: true })
         {
-            return hall.Center;
+            return StaticInteractionService.BuildApproachTarget(unit, hall);
         }
 
-        return TryBuildWorkerFlowTarget(unit.Id, hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: true, out var target)
+        return TryBuildWorkerFlowTarget(
+                unit,
+                hall.Center,
+                hall.SizeTiles,
+                hall.SizeTiles,
+                node.Center,
+                node.TileWidth,
+                node.TileHeight,
+                approachingHall: true,
+                out var target)
             ? target
-            : hall.Center;
+            : StaticInteractionService.BuildApproachTarget(unit, hall);
     }
 
     private static bool TryResolveOccupiedMoveTarget(
@@ -131,19 +149,21 @@ public static class MovementTargetResolver
 
         outward = outward.Normalized();
         var lateral = new Vector2(-outward.Y, outward.X);
-        var lane = CombatApproachService.CenteredSlotIndex(Mathf.PosMod(unit.Id, 5));
-        var rank = Mathf.PosMod(unit.Id / 5, 2);
-        var laneSpacing = float.Max(unit.Radius * 2f + 4f, GameConstants.GroupSpacing * 0.55f);
-        var rankSpacing = float.Max(unit.Radius * 2f + 6f, GameConstants.GroupSpacing * 0.42f);
+        var lane = CombatApproachService.CenteredSlotIndex(Mathf.PosMod(unit.Id, 3));
+        var rank = Mathf.PosMod(unit.Id / 3, 2);
+        var laneSpacing = float.Max(unit.Radius * 1.25f + 2f, GameConstants.GroupSpacing * 0.28f);
+        var rankSpacing = float.Max(unit.Radius * 0.95f + 2f, GameConstants.GroupSpacing * 0.18f);
         return anchor + outward * (arrivalRadius + rank * rankSpacing) + lateral * (lane * laneSpacing);
     }
 
     private static bool TryBuildWorkerFlowTarget(
-        int unitId,
+        SimUnit unit,
         Vector2 hallCenter,
-        float hallRadius,
+        int hallWidthTiles,
+        int hallHeightTiles,
         Vector2 nodeCenter,
-        float nodeRadius,
+        int nodeWidthTiles,
+        int nodeHeightTiles,
         bool approachingHall,
         out Vector2 target)
     {
@@ -156,17 +176,22 @@ public static class MovementTargetResolver
 
         var routeDirection = route.Normalized();
         var perpendicular = new Vector2(-routeDirection.Y, routeDirection.X);
-        var laneIndex = unitId % 5 - 2;
+        var laneIndex = unit.Id % 5 - 2;
         var laneOffset = perpendicular * (laneIndex * (GameConstants.WorkerFlowLaneOffset * 0.55f));
+        var interactionClearance = StaticInteractionService.GetInteractionClearance(unit);
 
         if (approachingHall)
         {
-            var depth = hallRadius + GameConstants.TileSize * 0.35f + Mathf.Abs(laneIndex) * 1.5f;
+            var depth = StaticInteractionService.GetDirectionalSupportDistance(routeDirection, hallWidthTiles, hallHeightTiles) +
+                        interactionClearance +
+                        Mathf.Abs(laneIndex) * 1.5f;
             target = hallCenter + routeDirection * depth - laneOffset;
             return true;
         }
 
-        var depthToNode = nodeRadius + GameConstants.TileSize * 0.28f + Mathf.Abs(laneIndex) * 1.2f;
+        var depthToNode = StaticInteractionService.GetDirectionalSupportDistance(routeDirection, nodeWidthTiles, nodeHeightTiles) +
+                          interactionClearance +
+                          Mathf.Abs(laneIndex) * 1.2f;
         target = nodeCenter - routeDirection * depthToNode + laneOffset;
         return true;
     }

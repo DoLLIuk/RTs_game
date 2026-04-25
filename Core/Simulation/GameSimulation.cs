@@ -44,6 +44,7 @@ public sealed partial class GameSimulation
 	private int _nextEntityId = 1;
 	private double _elapsedMs;
 	private double _aiTickAccumMs;
+	private int _nextMovementCohortId = 1;
 	private readonly DifficultyDefinition _difficultyDefinition;
 	private PlayerVisionSnapshot? _playerVisionSnapshot;
 	private AiState _aiState = AiState.Open;
@@ -195,6 +196,11 @@ public sealed partial class GameSimulation
 		IssueMove(unit, worldTarget, 0f, null);
 	}
 
+	public void IssueMoveGroup(IReadOnlyList<SimUnit> units, IReadOnlyList<Vector2> finalTargets, Vector2 sharedWorldTarget)
+	{
+		IssueMoveGroup(units, finalTargets, sharedWorldTarget, attackMove: false);
+	}
+
 	public void IssueMove(SimUnit unit, Vector2 worldTarget, float arrivalRadius, Vector2? interactionAnchor)
 	{
 		if (!unit.Alive)
@@ -224,6 +230,68 @@ public sealed partial class GameSimulation
 		unit.SetState(unit.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
 	}
 
+	private void IssueMoveGroup(IReadOnlyList<SimUnit> units, IReadOnlyList<Vector2> finalTargets, Vector2 sharedWorldTarget, bool attackMove)
+	{
+		if (units.Count == 0 || units.Count != finalTargets.Count)
+		{
+			return;
+		}
+
+		var cohortUnits = new List<SimUnit>(units.Count);
+		var cohortTargets = new List<Vector2>(units.Count);
+		for (var index = 0; index < units.Count; index++)
+		{
+			var unit = units[index];
+			if (!unit.Alive)
+			{
+				continue;
+			}
+
+			var finalTarget = finalTargets[index];
+			if (unit.IsWorker())
+			{
+				if (attackMove && unit.CanAttack())
+				{
+					IssueAttackMove(unit, finalTarget);
+				}
+				else
+				{
+					IssueMove(unit, finalTarget);
+				}
+
+				continue;
+			}
+
+			cohortUnits.Add(unit);
+			cohortTargets.Add(finalTarget);
+		}
+
+		if (cohortUnits.Count == 0)
+		{
+			return;
+		}
+
+		if (cohortUnits.Count == 1)
+		{
+			if (attackMove)
+			{
+				IssueAttackMove(cohortUnits[0], cohortTargets[0]);
+			}
+			else
+			{
+				IssueMove(cohortUnits[0], cohortTargets[0]);
+			}
+
+			return;
+		}
+
+		var cohortId = _nextMovementCohortId++;
+		for (var index = 0; index < cohortUnits.Count; index++)
+		{
+			IssueGroupedMove(cohortUnits[index], sharedWorldTarget, cohortTargets[index], cohortId, index, cohortUnits.Count, attackMove);
+		}
+	}
+
 	public void IssueAttackMove(SimUnit unit, Vector2 worldTarget)
 	{
 		if (!unit.Alive || !unit.CanAttack())
@@ -241,6 +309,11 @@ public sealed partial class GameSimulation
 		unit.AttackMoveTarget = worldTarget;
 		Repath(unit, worldTarget, 0f);
 		unit.SetState(unit.Path.Count > 0 ? UnitState.AttackMove : UnitState.Idle);
+	}
+
+	public void IssueAttackMoveGroup(IReadOnlyList<SimUnit> units, IReadOnlyList<Vector2> finalTargets, Vector2 sharedWorldTarget)
+	{
+		IssueMoveGroup(units, finalTargets, sharedWorldTarget, attackMove: true);
 	}
 
 	public void IssueAttack(SimUnit unit, ICombatTarget target)
@@ -284,8 +357,8 @@ public sealed partial class GameSimulation
 		unit.ClearOrders();
 		unit.TargetBuilding = site;
 		unit.SaveWorkerBuildOrder(site);
-		var reach = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(unit, site.Center, reach, interactionAnchor: site.Center);
+		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
+		Repath(unit, StaticInteractionService.BuildApproachTarget(unit, site), arrivalRadius, interactionAnchor: site.Center);
 		unit.SetState(UnitState.Build);
 	}
 
@@ -302,14 +375,37 @@ public sealed partial class GameSimulation
 		}
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
-		var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
+		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
+		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
 	public void IssueStop(SimUnit unit)
 	{
 		unit.ClearOrders();
+	}
+
+	private void IssueGroupedMove(
+		SimUnit unit,
+		Vector2 sharedWorldTarget,
+		Vector2 finalWorldTarget,
+		int cohortId,
+		int cohortIndex,
+		int cohortCount,
+		bool attackMove)
+	{
+		unit.ClearOrders();
+		unit.AssignMovementCohort(cohortId, cohortIndex, cohortCount, sharedWorldTarget, finalWorldTarget, useTerminalFormation: true);
+		if (attackMove)
+		{
+			unit.AttackMoveTarget = finalWorldTarget;
+		}
+
+		var initialTarget = unit.SharedMoveTarget ?? sharedWorldTarget;
+		Repath(unit, initialTarget, 0f);
+		unit.SetState(unit.Path.Count > 0
+			? (attackMove ? UnitState.AttackMove : UnitState.Move)
+			: UnitState.Idle);
 	}
 
 	public BuildingPlacementResult EvaluateBuildingPlacement(GameSide side, BuildingKind kind, Vector2I tilePosition)
@@ -592,8 +688,16 @@ public sealed partial class GameSimulation
 			unit.TargetCombat = null;
 			if (unit.AttackMoveTarget.HasValue)
 			{
-				var resume = unit.AttackMoveTarget.Value;
-				Repath(unit, resume, 0f);
+				if (_unitPathService.TryGetRepathRequest(unit, out var resumeRequest))
+				{
+					_unitPathService.Repath(unit, resumeRequest, _elapsedMs);
+				}
+				else
+				{
+					var resume = unit.AttackMoveTarget.Value;
+					Repath(unit, resume, 0f);
+				}
+
 				unit.SetState(unit.Path.Count > 0 ? UnitState.AttackMove : UnitState.Idle);
 				return;
 			}
@@ -688,13 +792,15 @@ public sealed partial class GameSimulation
 			return;
 		}
 
-		var reach = node.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		var distance = unit.Position.DistanceTo(node.Center);
-		if (distance > reach)
+		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, node))
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, MovementTargetResolver.GetWorkerGatherPathTarget(unit, node, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit)), reach, interactionAnchor: node.Center);
+				Repath(
+					unit,
+					MovementTargetResolver.GetWorkerGatherPathTarget(unit, node, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit)),
+					GetStaticApproachArrivalRadius(unit),
+					interactionAnchor: node.Center);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -743,13 +849,11 @@ public sealed partial class GameSimulation
 			return;
 		}
 
-		var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		var distance = unit.Position.DistanceTo(hall.Center);
-		if (distance > reach)
+		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, hall))
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
+				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), GetStaticApproachArrivalRadius(unit), interactionAnchor: hall.Center);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -801,13 +905,11 @@ public sealed partial class GameSimulation
 			return;
 		}
 
-		var reach = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		var distance = unit.Position.DistanceTo(site.Center);
-		if (distance > reach)
+		if (!StaticInteractionService.IsWithinInteractionRange(unit, unit.Position, site))
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, site.Center, reach, interactionAnchor: site.Center);
+				Repath(unit, StaticInteractionService.BuildApproachTarget(unit, site), GetStaticApproachArrivalRadius(unit), interactionAnchor: site.Center);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -992,6 +1094,11 @@ public sealed partial class GameSimulation
 		return unit.Range + target.Radius + unit.Radius + (target.IsBuilding ? GameConstants.TileSize * 0.65f : 0f);
 	}
 
+	private static float GetStaticApproachArrivalRadius(SimUnit unit)
+	{
+		return Mathf.Max(10f, unit.Radius * 0.75f);
+	}
+
 	private static float ScoreUnitTarget(SimUnit unit, SimUnit target, float distance)
 	{
 		var score = distance;
@@ -1116,8 +1223,8 @@ public sealed partial class GameSimulation
 
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
-		var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
+		var arrivalRadius = GetStaticApproachArrivalRadius(unit);
+		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
@@ -1183,8 +1290,8 @@ public sealed partial class GameSimulation
 		worker.WorkerSafeCombatRadius = hall.Radius * GameConstants.WorkerSafeCombatHallRadiusMultiplier;
 		worker.WorkerCombatLeashRadius = hall.Radius * GameConstants.WorkerCombatLeashHallRadiusMultiplier;
 		worker.ReturnBuilding = hall;
-		var reach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), reach, interactionAnchor: hall.Center);
+		var arrivalRadius = GetStaticApproachArrivalRadius(worker);
+		Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), arrivalRadius, interactionAnchor: hall.Center);
 		worker.SetState(worker.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
 	}
 
@@ -1213,13 +1320,11 @@ public sealed partial class GameSimulation
 		worker.WorkerSafeCombatRadius = hall.Radius * GameConstants.WorkerSafeCombatHallRadiusMultiplier;
 		worker.WorkerCombatLeashRadius = hall.Radius * GameConstants.WorkerCombatLeashHallRadiusMultiplier;
 
-		var reach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		var distance = worker.Position.DistanceTo(hall.Center);
-		if (distance > reach)
+		if (!StaticInteractionService.IsWithinInteractionRange(worker, worker.Position, hall))
 		{
 			if (worker.Path.Count == 0 || worker.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), reach, interactionAnchor: hall.Center);
+				Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), GetStaticApproachArrivalRadius(worker), interactionAnchor: hall.Center);
 			}
 
 			AdvanceWithRecovery(worker, delta);
@@ -1348,8 +1453,8 @@ public sealed partial class GameSimulation
 				{
 					worker.ClearOrders(false);
 					worker.TargetBuilding = site;
-					var buildReach = site.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-					Repath(worker, site.Center, buildReach, interactionAnchor: site.Center);
+					var buildArrivalRadius = GetStaticApproachArrivalRadius(worker);
+					Repath(worker, StaticInteractionService.BuildApproachTarget(worker, site), buildArrivalRadius, interactionAnchor: site.Center);
 					worker.SetState(UnitState.Build);
 					return;
 				}
@@ -1364,8 +1469,8 @@ public sealed partial class GameSimulation
 					{
 						worker.ClearOrders(false);
 						worker.ReturnBuilding = hall;
-						var returnReach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-						Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), returnReach, interactionAnchor: hall.Center);
+						var returnArrivalRadius = GetStaticApproachArrivalRadius(worker);
+						Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), returnArrivalRadius, interactionAnchor: hall.Center);
 						worker.SetState(UnitState.ReturnCargo);
 						return;
 					}
@@ -1768,6 +1873,8 @@ public sealed partial class GameSimulation
 
 		var spacing = GameConstants.GroupSpacing;
 		var start = -(units.Count - 1) * 0.5f;
+		var destinations = new List<Vector2>(units.Count);
+		var movers = new List<SimUnit>(units.Count);
 		for (var index = 0; index < units.Count; index++)
 		{
 			var destination = rowAnchor + side * (start + index) * spacing;
@@ -1776,14 +1883,22 @@ public sealed partial class GameSimulation
 				continue;
 			}
 
-			if (attackMove)
-			{
-				CommandUnitAttackMove(units[index], destination);
-			}
-			else
-			{
-				CommandUnitMove(units[index], destination);
-			}
+			movers.Add(units[index]);
+			destinations.Add(destination);
+		}
+
+		if (movers.Count == 0)
+		{
+			return;
+		}
+
+		if (attackMove)
+		{
+			IssueAttackMoveGroup(movers, destinations, rowAnchor);
+		}
+		else
+		{
+			IssueMoveGroup(movers, destinations, rowAnchor);
 		}
 	}
 

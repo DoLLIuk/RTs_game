@@ -90,6 +90,13 @@ public sealed class SimUnit : ICombatTarget
     public Vector2? MoveInteractionAnchor { get; set; }
     public float MoveArrivalRadius { get; set; }
     public Vector2? AttackMoveTarget { get; set; }
+    public Vector2? SharedMoveTarget { get; set; }
+    public Vector2? FinalMoveTarget { get; set; }
+    public int MovementCohortId { get; set; }
+    public int MovementCohortIndex { get; set; }
+    public int MovementCohortCount { get; set; }
+    public bool UseTerminalFormation { get; set; }
+    public bool IsInTerminalFormation { get; set; }
     public double PathRepathMs { get; set; }
     public double StuckAccumMs { get; set; }
     public double PathProgressStallMs { get; set; }
@@ -116,6 +123,7 @@ public sealed class SimUnit : ICombatTarget
     public float WorkerCombatLeashRadius { get; set; }
     public double WorkerThreatQuietMs { get; set; }
     public bool IsNonCombatScout { get; set; }
+    public bool HasMovementCohort => MovementCohortId != 0 && SharedMoveTarget.HasValue && FinalMoveTarget.HasValue;
 
     public void SetPath(IEnumerable<Vector2> points)
     {
@@ -142,6 +150,7 @@ public sealed class SimUnit : ICombatTarget
             MoveInteractionAnchor = null;
             MoveArrivalRadius = 0f;
             AttackMoveTarget = null;
+            ClearMovementCohort();
             StuckAccumMs = 0d;
             PathProgressStallMs = 0d;
             LastHeavyRerouteMs = -99999d;
@@ -157,6 +166,7 @@ public sealed class SimUnit : ICombatTarget
         MoveInteractionAnchor = null;
         MoveArrivalRadius = 0f;
         AttackMoveTarget = null;
+        ClearMovementCohort();
         PathRepathMs = 0d;
         StuckAccumMs = 0d;
         PathProgressStallMs = 0d;
@@ -283,5 +293,33 @@ public sealed class SimUnit : ICombatTarget
         WorkerSavedBuildTarget = null;
         WorkerSavedReturnHall = null;
         WorkerSavedDesiredResourceType = null;
+    }
+
+    public void AssignMovementCohort(
+        int cohortId,
+        int cohortIndex,
+        int cohortCount,
+        Vector2 sharedMoveTarget,
+        Vector2 finalMoveTarget,
+        bool useTerminalFormation)
+    {
+        MovementCohortId = cohortId;
+        MovementCohortIndex = cohortIndex;
+        MovementCohortCount = cohortCount;
+        SharedMoveTarget = sharedMoveTarget;
+        FinalMoveTarget = finalMoveTarget;
+        UseTerminalFormation = useTerminalFormation;
+        IsInTerminalFormation = !useTerminalFormation;
+    }
+
+    public void ClearMovementCohort()
+    {
+        SharedMoveTarget = null;
+        FinalMoveTarget = null;
+        MovementCohortId = 0;
+        MovementCohortIndex = 0;
+        MovementCohortCount = 0;
+        UseTerminalFormation = false;
+        IsInTerminalFormation = false;
     }
 }

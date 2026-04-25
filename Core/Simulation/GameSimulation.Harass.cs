@@ -20,6 +20,7 @@ public sealed partial class GameSimulation
             FindAssaultApproachPoint,
             _aiArmyManager.CalculateMetrics,
             CommandUnitMove,
+            IssueMoveGroup,
             IssueAttack);
     }
 

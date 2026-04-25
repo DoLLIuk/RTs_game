@@ -36,6 +36,11 @@ public sealed class UnitSeparationService
                     continue;
                 }
 
+                if (SharesActiveMarchCohort(first, second))
+                {
+                    continue;
+                }
+
                 var minimum = first.Radius + second.Radius + 1.25f;
                 var deltaVector = second.Position - first.Position;
                 var distance = deltaVector.Length();
@@ -174,6 +179,27 @@ public sealed class UnitSeparationService
             UnitState.AttackMove => 3,
             _ => 1
         };
+    }
+
+    private static bool SharesActiveMarchCohort(SimUnit first, SimUnit second)
+    {
+        if (!first.HasMovementCohort ||
+            !second.HasMovementCohort ||
+            first.MovementCohortId == 0 ||
+            first.MovementCohortId != second.MovementCohortId ||
+            first.IsInTerminalFormation ||
+            second.IsInTerminalFormation ||
+            first.State is not UnitState.Move and not UnitState.AttackMove ||
+            second.State is not UnitState.Move and not UnitState.AttackMove)
+        {
+            return false;
+        }
+
+        var firstDirection = GetPathTravelDirection(first);
+        var secondDirection = GetPathTravelDirection(second);
+        return firstDirection != Vector2.Zero &&
+               secondDirection != Vector2.Zero &&
+               firstDirection.Dot(secondDirection) >= 0.65f;
     }
 
     private void TryNudge(SimUnit unit, Vector2 offset, SimUnit? ignoredUnit = null)

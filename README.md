@@ -43,7 +43,7 @@
 - [Core/Data/GameSettings.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Data/GameSettings.cs)
   Стартовые настройки матча, уровни сложности и AI profile.
 - [Core/Simulation/GameSimulation.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/GameSimulation.cs)
-  Сердце игры: update loop, команды юнитам, бой, экономика, здания, AI, победа/поражение.
+  Сердце игры: update loop, команды юнитам, бой, экономика, здания, AI, победа/поражение. Pathfinding и local movement теперь в основном вынесены в отдельные сервисы.
 - [Core/Simulation/Units/SimUnit.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Units/SimUnit.cs)
   Runtime-состояние юнита, его приказы и worker-specific поля.
 - [Core/Simulation/Buildings/SimBuilding.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Buildings/SimBuilding.cs)
@@ -52,8 +52,22 @@
   Узлы ресурсов.
 - [Core/Simulation/Economy/EconomySystem.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Economy/EconomySystem.cs)
   Деньги, дерево, food, cap.
+- [Core/Simulation/Pathfinding/PathRequest.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/PathRequest.cs) и [Core/Simulation/Pathfinding/PathPlan.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/PathPlan.cs)
+  Контракты pathfinding-запроса и результата.
 - [Core/Simulation/Pathfinding/Pathfinder.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/Pathfinder.cs)
-  A* pathfinding c несколькими goal-кандидатами и штрафами на занятые тайлы.
+  Базовый A* pathfinding c несколькими goal-кандидатами и штрафами на занятые тайлы.
+- [Core/Simulation/Pathfinding/UnitPathService.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/UnitPathService.cs)
+  Repath, dynamic tile penalties, anti-stuck и восстановление движения.
+- [Core/Simulation/Pathfinding/LocalMovementService.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/LocalMovementService.cs)
+  Локальный шаг, steering, collision checks и запрет захода в footprint статических объектов.
+- [Core/Simulation/Pathfinding/UnitSeparationService.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/UnitSeparationService.cs)
+  Separation и head-on deadlock resolution.
+- [Core/Simulation/Pathfinding/StaticInteractionService.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/StaticInteractionService.cs)
+  Footprint-based interaction range и точки подхода к зданиям/ресурсам.
+- [Core/Simulation/Pathfinding/MovementTargetResolver.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/MovementTargetResolver.cs)
+  Resolve логики для occupied targets, worker gather/return flow и static approach targets.
+- [Core/Simulation/Pathfinding/CombatApproachService.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/Pathfinding/CombatApproachService.cs)
+  Слоты подхода к боевым целям для melee и ranged.
 - [Core/Simulation/World/MapGenerator.cs](/C:/Users/golov/rofl_codex/RTS_spizjeno/rts-na-godote/Core/Simulation/World/MapGenerator.cs)
   Генерация симметричной карты.
 
@@ -114,10 +128,16 @@
 ### Pathfinding и движение
 
 - Основа: A* по тайловой карте.
+- `Pathfinder` отвечает только за базовый маршрут.
+- `UnitPathService` держит repath, dynamic penalties и anti-stuck.
+- `LocalMovementService` отвечает за steering и локальные collision checks.
+- `UnitSeparationService` обрабатывает separation и head-on deadlock resolution.
 - Для цели может использоваться не один фиксированный тайл, а несколько кандидатов вокруг нее.
 - В pathfinding есть `tieBreakerSeed`, чтобы одинаковые юниты не строили один и тот же маршрут.
 - Есть мягкие tile-penalty вокруг других юнитов, чтобы пачка естественнее расходилась.
-- Для боя, добычи, возврата ресурсов и стройки near-goal логика теперь старается разводить союзных юнитов по разным slot-кандидатам вокруг одной цели.
+- Для боя, добычи, возврата ресурсов и стройки near-goal логика теперь разводит союзных юнитов по разным slot-кандидатам вокруг одной цели.
+- Для зданий и ресурсов interaction и final-approach теперь считаются по реальному footprint объекта, а не только по круговому радиусу.
+- У статических целей используется footprint-based interaction range и несколько face-slots вдоль стороны подхода, чтобы юниты не ощущались привязанными к одной точке.
 - Поверх pathfinding работает ослабленный anti-stuck:
   - срабатывает только если юнит реально почти не двигается
   - порог сейчас около `1 секунды`
@@ -216,7 +236,7 @@
 ## Текущее состояние и ограничения
 
 - Проект уже хорошо подходит для gameplay-итераций.
-- Основная архитектура понятная и расширяемая, но многое все еще завязано в одном большом `GameSimulation`.
+- Основная архитектура стала чище: pathfinding и движение уже вынесены в отдельные сервисы, но `GameSimulation` все еще остается крупным orchestration-слоем.
 - Enemy AI уже играбелен, но еще требует живой балансировки таймингов и порогов.
 - Продвинутого микроконтроля вроде kite, split, spell logic и true threat map пока нет.
 - Expansions, multi-base macro и глубокая tech progression пока не реализованы.
@@ -224,6 +244,7 @@
 ## Куда расширять дальше
 
 - вынести AI из `GameSimulation` в отдельные компоненты/сервисы
+- унифицировать formation logic в `RtsGame` с footprint-based slot logic из simulation/pathfinding
 - добавить debug HUD для текущего `AiState`, squad metrics и memory
 - развить build-order / tech goals / expansions
 - добавить сохранение и повтор воспроизводимых сценариев по seed

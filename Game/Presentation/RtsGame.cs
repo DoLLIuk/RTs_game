@@ -1004,10 +1004,7 @@ public partial class RtsGame : Node2D
         }
 
         var slots = FormationSlots(units, worldPosition, occupiedCenter, occupiedRadius);
-        for (var i = 0; i < units.Count; i++)
-        {
-            _simulation.IssueMove(units[i], slots[i]);
-        }
+        _simulation.IssueMoveGroup(units, slots, worldPosition);
 
         _lastCommand = GameUiText.CommandMove(FormatVector(worldPosition));
         _effectsLayer.CommandMarker(worldPosition, new Color(0.42f, 1f, 0.48f), GameUiText.MarkerMove);
@@ -1023,10 +1020,7 @@ public partial class RtsGame : Node2D
 
         var units = GetControllableSelectedUnits();
         var slots = FormationSlots(units, worldPosition);
-        for (var i = 0; i < units.Count; i++)
-        {
-            _simulation.IssueAttackMove(units[i], slots[i]);
-        }
+        _simulation.IssueAttackMoveGroup(units, slots, worldPosition);
 
         _lastCommand = GameUiText.CommandAttackMove(FormatVector(worldPosition));
         _effectsLayer.CommandMarker(worldPosition, new Color(1f, 0.62f, 0.34f), GameUiText.MarkerAttack);

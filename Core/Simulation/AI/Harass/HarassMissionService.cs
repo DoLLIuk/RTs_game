@@ -761,11 +761,14 @@ internal sealed class HarassMissionService
 
         var spacing = GameConstants.GroupSpacing;
         var start = -(units.Count - 1) * 0.5f;
+        var destinations = new List<Vector2>(units.Count);
         for (var index = 0; index < units.Count; index++)
         {
             var destination = rowAnchor + side * (start + index) * spacing;
-            _context.CommandUnitMove(units[index], destination);
+            destinations.Add(destination);
         }
+
+        _context.CommandUnitMoveGroup(units, destinations, rowAnchor);
     }
 
     private ICombatTarget? FindPreferredEnemy(SimUnit unit)

@@ -25,6 +25,7 @@ public static class GameConstants
 	public const int WorkerCarry = 10;
 	public const int GatherTimeMs = 1650;
 	public const float GatherReachPaddingTiles = 1.5f;
+	public const float StaticInteractionReachScale = 0.55f;
 	public const int AITickMs = 700;
 	public const float SelectionDragThreshold = 12f;
 	public const float GroupSpacing = 34f;
