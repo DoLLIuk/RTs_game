@@ -55,9 +55,16 @@ public static class Pathfinder
             return [];
         }
 
-        var open = new Dictionary<int, Node>();
-        var closed = new bool[GameConstants.MapWidth * GameConstants.MapHeight];
-        open[Key(start.X, start.Y)] = new Node(start.X, start.Y, 0f, Heuristic(start, actualGoals), null);
+        var startKey = Key(start.X, start.Y);
+        var parent = new int[GameConstants.MapWidth * GameConstants.MapHeight];
+        var gScore = new float[parent.Length];
+        var closed = new bool[parent.Length];
+        Array.Fill(parent, -1);
+        Array.Fill(gScore, float.PositiveInfinity);
+
+        var open = new PriorityQueue<int, float>();
+        gScore[startKey] = 0f;
+        open.Enqueue(startKey, Heuristic(start, actualGoals));
 
         var iterations = 0;
         while (open.Count > 0)
@@ -67,57 +74,51 @@ public static class Pathfinder
                 break;
             }
 
-            var current = FindBest(open);
-            open.Remove(Key(current.Tx, current.Ty));
-            closed[Key(current.Tx, current.Ty)] = true;
-
-            if (goalKeys.Contains(Key(current.Tx, current.Ty)))
+            var currentKey = open.Dequeue();
+            if (closed[currentKey])
             {
-                return Reconstruct(current);
+                continue;
+            }
+
+            closed[currentKey] = true;
+            var current = FromKey(currentKey);
+
+            if (goalKeys.Contains(currentKey))
+            {
+                return Reconstruct(parent, currentKey);
             }
 
             for (var offset = 0; offset < Directions.Length; offset++)
             {
                 var direction = Directions[(offset + tieBreakerSeed) % Directions.Length];
-                var nx = current.Tx + direction.Dx;
-                var ny = current.Ty + direction.Dy;
-                if (!map.InBounds(nx, ny) || closed[Key(nx, ny)] || !map.IsWalkable(nx, ny))
+                var nx = current.X + direction.Dx;
+                var ny = current.Y + direction.Dy;
+                var nextKey = Key(nx, ny);
+                if (!map.InBounds(nx, ny) || closed[nextKey] || !map.IsWalkable(nx, ny))
                 {
                     continue;
                 }
 
                 if (direction.Dx != 0 && direction.Dy != 0 &&
-                    (!map.IsWalkable(current.Tx + direction.Dx, current.Ty) || !map.IsWalkable(current.Tx, current.Ty + direction.Dy)))
+                    (!map.IsWalkable(current.X + direction.Dx, current.Y) || !map.IsWalkable(current.X, current.Y + direction.Dy)))
                 {
                     continue;
                 }
 
-                var g = current.G + direction.Cost + GetTilePenalty(tilePenalty, nx, ny);
-                var key = Key(nx, ny);
-                if (open.TryGetValue(key, out var existing) && existing.G <= g)
+                var g = gScore[currentKey] + direction.Cost + GetTilePenalty(tilePenalty, nx, ny);
+                if (g >= gScore[nextKey])
                 {
                     continue;
                 }
 
-                open[key] = new Node(nx, ny, g, g + Heuristic(new Vector2I(nx, ny), actualGoals), current);
+                parent[nextKey] = currentKey;
+                gScore[nextKey] = g;
+                var f = g + Heuristic(new Vector2I(nx, ny), actualGoals) + TieBreaker(new Vector2I(nx, ny), tieBreakerSeed) * 0.001f;
+                open.Enqueue(nextKey, f);
             }
         }
 
         return [];
-    }
-
-    private static Node FindBest(Dictionary<int, Node> open)
-    {
-        Node? best = null;
-        foreach (var candidate in open.Values)
-        {
-            if (best is null || candidate.F < best.F)
-            {
-                best = candidate;
-            }
-        }
-
-        return best ?? throw new InvalidOperationException("Open set was empty.");
     }
 
     private static List<Vector2I> FindGoalCandidates(
@@ -175,12 +176,12 @@ public static class Pathfinder
         return result;
     }
 
-    private static List<Vector2I> Reconstruct(Node end)
+    private static List<Vector2I> Reconstruct(int[] parent, int endKey)
     {
         var result = new List<Vector2I>();
-        for (var node = end; node.Parent is not null; node = node.Parent)
+        for (var current = endKey; parent[current] >= 0; current = parent[current])
         {
-            result.Insert(0, new Vector2I(node.Tx, node.Ty));
+            result.Insert(0, FromKey(current));
         }
 
         return result;
@@ -252,5 +253,10 @@ public static class Pathfinder
 
     private static int Key(int tx, int ty) => ty * GameConstants.MapWidth + tx;
 
-    private sealed record Node(int Tx, int Ty, float G, float F, Node? Parent);
+    private static Vector2I FromKey(int key)
+    {
+        var ty = key / GameConstants.MapWidth;
+        var tx = key - ty * GameConstants.MapWidth;
+        return new Vector2I(tx, ty);
+    }
 }

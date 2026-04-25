@@ -709,6 +709,18 @@ public partial class RtsGame : Node2D
             }
         }
 
+        if (unit is not null && unit.Side == GameSide.Player)
+        {
+            IssueMoveGroup(controllableUnits, worldPosition, unit.Position, unit.Radius);
+            return;
+        }
+
+        if (building is not null && building.Side == GameSide.Player)
+        {
+            IssueMoveGroup(controllableUnits, worldPosition, building.Center, building.Radius);
+            return;
+        }
+
         IssueMoveGroup(controllableUnits, worldPosition);
     }
 
@@ -984,14 +996,14 @@ public partial class RtsGame : Node2D
         _audio.PlayBuild();
     }
 
-    private void IssueMoveGroup(List<SimUnit> units, Vector2 worldPosition)
+    private void IssueMoveGroup(List<SimUnit> units, Vector2 worldPosition, Vector2? occupiedCenter = null, float occupiedRadius = 0f)
     {
         if (_simulation is null)
         {
             return;
         }
 
-        var slots = FormationSlots(units.Count, worldPosition);
+        var slots = FormationSlots(units, worldPosition, occupiedCenter, occupiedRadius);
         for (var i = 0; i < units.Count; i++)
         {
             _simulation.IssueMove(units[i], slots[i]);
@@ -1010,7 +1022,7 @@ public partial class RtsGame : Node2D
         }
 
         var units = GetControllableSelectedUnits();
-        var slots = FormationSlots(units.Count, worldPosition);
+        var slots = FormationSlots(units, worldPosition);
         for (var i = 0; i < units.Count; i++)
         {
             _simulation.IssueAttackMove(units[i], slots[i]);
@@ -1076,12 +1088,18 @@ public partial class RtsGame : Node2D
         ClampCamera(GetViewportRect().Size);
     }
 
-    private static List<Vector2> FormationSlots(int count, Vector2 center)
+    private static List<Vector2> FormationSlots(IReadOnlyList<SimUnit> units, Vector2 center, Vector2? occupiedCenter = null, float occupiedRadius = 0f)
     {
+        var count = units.Count;
         var slots = new List<Vector2>(count);
         if (count <= 0)
         {
             return slots;
+        }
+
+        if (occupiedCenter.HasValue && occupiedRadius > 0.01f)
+        {
+            return BuildOccupiedFormationSlots(units, center, occupiedCenter.Value, occupiedRadius);
         }
 
         var columns = Mathf.CeilToInt(Mathf.Sqrt(count));
@@ -1099,6 +1117,61 @@ public partial class RtsGame : Node2D
         }
 
         return slots;
+    }
+
+    private static List<Vector2> BuildOccupiedFormationSlots(IReadOnlyList<SimUnit> units, Vector2 clickPosition, Vector2 occupiedCenter, float occupiedRadius)
+    {
+        var count = units.Count;
+        var slots = new List<Vector2>(count);
+        if (count <= 0)
+        {
+            return slots;
+        }
+
+        var outward = clickPosition - occupiedCenter;
+        if (outward.LengthSquared() <= 16f)
+        {
+            outward = occupiedCenter - ComputeUnitCentroid(units);
+        }
+
+        if (outward.LengthSquared() <= 16f)
+        {
+            outward = Vector2.Down;
+        }
+
+        outward = outward.Normalized();
+        var lateral = new Vector2(-outward.Y, outward.X);
+        var columns = Mathf.CeilToInt(Mathf.Sqrt(count));
+        var outwardSpacing = GameConstants.GroupSpacing * 0.9f;
+        var baseDistance = occupiedRadius + GameConstants.GroupSpacing * 0.65f;
+        var width = (columns - 1) * GameConstants.GroupSpacing;
+
+        for (var index = 0; index < count; index++)
+        {
+            var row = index / columns;
+            var column = index % columns;
+            var lateralOffset = column * GameConstants.GroupSpacing - width / 2f;
+            var distance = baseDistance + row * outwardSpacing;
+            slots.Add(occupiedCenter + outward * distance + lateral * lateralOffset);
+        }
+
+        return slots;
+    }
+
+    private static Vector2 ComputeUnitCentroid(IReadOnlyList<SimUnit> units)
+    {
+        if (units.Count == 0)
+        {
+            return Vector2.Zero;
+        }
+
+        var center = Vector2.Zero;
+        for (var index = 0; index < units.Count; index++)
+        {
+            center += units[index].Position;
+        }
+
+        return center / units.Count;
     }
 
     private void SyncViews()

@@ -87,6 +87,8 @@ public sealed class SimUnit : ICombatTarget
     public UnitState State { get; private set; } = UnitState.Idle;
     public List<Vector2> Path { get; } = [];
     public Vector2? PathDestination { get; set; }
+    public Vector2? MoveInteractionAnchor { get; set; }
+    public float MoveArrivalRadius { get; set; }
     public Vector2? AttackMoveTarget { get; set; }
     public double PathRepathMs { get; set; }
     public double StuckAccumMs { get; set; }
@@ -137,6 +139,8 @@ public sealed class SimUnit : ICombatTarget
         {
             Path.Clear();
             PathDestination = null;
+            MoveInteractionAnchor = null;
+            MoveArrivalRadius = 0f;
             AttackMoveTarget = null;
             StuckAccumMs = 0d;
             PathProgressStallMs = 0d;
@@ -150,6 +154,8 @@ public sealed class SimUnit : ICombatTarget
         Path.Clear();
         State = Alive ? UnitState.Idle : UnitState.Dead;
         PathDestination = null;
+        MoveInteractionAnchor = null;
+        MoveArrivalRadius = 0f;
         AttackMoveTarget = null;
         PathRepathMs = 0d;
         StuckAccumMs = 0d;

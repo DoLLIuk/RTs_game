@@ -18,14 +18,6 @@ public sealed partial class GameSimulation
 	private const float CombatBuildingTargetPenalty = 72f;
 	private const float CombatRetargetBuffer = 18f;
 	private const float AiAssaultStandoffDistance = GameConstants.TileSize * 3f;
-	private const float HeavyRerouteCooldownMs = 650f;
-	private const float HeavyRerouteTriggerMs = 1100f;
-	private const float CompactSideStepFactor = 0.45f;
-	private const float CompactForwardBiasFactor = 0.2f;
-	private const float SoftUnitTilePenalty = 2.1f;
-	private const float SoftUnitNeighborTilePenalty = 0.35f;
-	private const float StaticBlockerTilePenalty = 110f;
-	private const float StaticBlockerNeighborTilePenalty = 18f;
 	private const float ScoutQuietWindowMs = 1800f;
 	private const float ScoutContinueAfterConfirmMs = 5200f;
 	private const float ScoutDangerBuffer = GameConstants.TileSize * 1.75f;
@@ -38,7 +30,6 @@ public sealed partial class GameSimulation
 	private const int ScoutMinPeekVisibleTiles = 2;
 	private const int FrontierScoutPreferredPeekDepthTiles = 2;
 	private const int FrontierScoutMaxPeekDepthTiles = 3;
-	private readonly record struct CombatApproachSlot(Vector2 Target, float ArrivalRadius);
 
 	public event Action<Vector2, Vector2, GameSide, bool, bool>? ProjectileLaunched;
 	public event Action<Vector2, bool, int>? HitOccurred;
@@ -60,6 +51,9 @@ public sealed partial class GameSimulation
 	private double _aiLastScoutCommandMs = -99999d;
 	private double _aiLastHarassCommandMs = -99999d;
 	private double _aiLastMainCommandMs = -99999d;
+	private readonly LocalMovementService _localMovementService;
+	private readonly UnitPathService _unitPathService;
+	private readonly UnitSeparationService _unitSeparationService;
 
 	public GameSimulation(GameInit init)
 	{
@@ -75,6 +69,9 @@ public sealed partial class GameSimulation
 		Buildings = [];
 		Resources = [];
 		Economy = new EconomySystem();
+		_localMovementService = new LocalMovementService(Map, Units, Buildings, Resources);
+		_unitPathService = new UnitPathService(Map, Units, Buildings, Resources, FindNearestHall, GetAttackRange, _localMovementService);
+		_unitSeparationService = new UnitSeparationService(Units, _localMovementService);
 		_aiStateEnteredMs = 0d;
 		_aiKnowledge = new AiKnowledgeService(CreateAiKnowledgeContext());
 		_aiArmyManager = new AiArmyManager(CreateAiArmyManagerContext());
@@ -166,7 +163,7 @@ public sealed partial class GameSimulation
 			}
 		}
 
-		ApplySeparation(delta);
+		_unitSeparationService.ApplySeparation(delta);
 
 		foreach (var building in Buildings)
 		{
@@ -195,6 +192,11 @@ public sealed partial class GameSimulation
 
 	public void IssueMove(SimUnit unit, Vector2 worldTarget)
 	{
+		IssueMove(unit, worldTarget, 0f, null);
+	}
+
+	public void IssueMove(SimUnit unit, Vector2 worldTarget, float arrivalRadius, Vector2? interactionAnchor)
+	{
 		if (!unit.Alive)
 		{
 			return;
@@ -205,7 +207,20 @@ public sealed partial class GameSimulation
 		{
 			unit.SaveWorkerMoveOrder(worldTarget);
 		}
-		Repath(unit, worldTarget, 0f);
+
+		var resolvedTarget = worldTarget;
+		var resolvedArrivalRadius = arrivalRadius;
+		var resolvedAnchor = interactionAnchor ?? worldTarget;
+		if (MovementTargetResolver.TryResolveOccupiedMoveTarget(unit, worldTarget, Units, Buildings, Resources, out var approachTarget, out var occupiedArrivalRadius, out var occupiedAnchor))
+		{
+			resolvedTarget = approachTarget;
+			resolvedArrivalRadius = float.Max(resolvedArrivalRadius, occupiedArrivalRadius);
+			resolvedAnchor = occupiedAnchor;
+		}
+
+		unit.MoveInteractionAnchor = resolvedAnchor;
+		unit.MoveArrivalRadius = resolvedArrivalRadius;
+		Repath(unit, resolvedTarget, resolvedArrivalRadius, interactionAnchor: resolvedAnchor);
 		unit.SetState(unit.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
 	}
 
@@ -288,7 +303,7 @@ public sealed partial class GameSimulation
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
 		var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
+		Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
@@ -601,7 +616,7 @@ public sealed partial class GameSimulation
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				if (TryBuildCombatApproachTarget(unit, target, out var approachTarget, out var approachArrivalRadius))
+				if (CombatApproachService.TryBuildCombatApproachTarget(unit, target, out var approachTarget, out var approachArrivalRadius))
 				{
 					Repath(unit, approachTarget, approachArrivalRadius, interactionAnchor: target.Position);
 				}
@@ -679,7 +694,7 @@ public sealed partial class GameSimulation
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, GetWorkerGatherPathTarget(unit, node), reach, interactionAnchor: node.Center);
+				Repath(unit, MovementTargetResolver.GetWorkerGatherPathTarget(unit, node, unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit)), reach, interactionAnchor: node.Center);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -734,7 +749,7 @@ public sealed partial class GameSimulation
 		{
 			if (unit.Path.Count == 0 || unit.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
+				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
 			}
 
 			AdvanceWithRecovery(unit, delta);
@@ -1102,7 +1117,7 @@ public sealed partial class GameSimulation
 		unit.ReturnBuilding = hall;
 		unit.Path.Clear();
 		var reach = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(unit, GetWorkerReturnPathTarget(unit, hall), reach, interactionAnchor: hall.Center);
+				Repath(unit, MovementTargetResolver.GetWorkerReturnPathTarget(unit, hall, unit.TargetResource), reach, interactionAnchor: hall.Center);
 		unit.SetState(UnitState.ReturnCargo);
 	}
 
@@ -1169,7 +1184,7 @@ public sealed partial class GameSimulation
 		worker.WorkerCombatLeashRadius = hall.Radius * GameConstants.WorkerCombatLeashHallRadiusMultiplier;
 		worker.ReturnBuilding = hall;
 		var reach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-		Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach, interactionAnchor: hall.Center);
+		Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), reach, interactionAnchor: hall.Center);
 		worker.SetState(worker.Path.Count > 0 ? UnitState.Move : UnitState.Idle);
 	}
 
@@ -1204,7 +1219,7 @@ public sealed partial class GameSimulation
 		{
 			if (worker.Path.Count == 0 || worker.PathRepathMs >= GameConstants.RepathIntervalMs)
 			{
-				Repath(worker, GetWorkerReturnPathTarget(worker, hall), reach, interactionAnchor: hall.Center);
+				Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), reach, interactionAnchor: hall.Center);
 			}
 
 			AdvanceWithRecovery(worker, delta);
@@ -1350,7 +1365,7 @@ public sealed partial class GameSimulation
 						worker.ClearOrders(false);
 						worker.ReturnBuilding = hall;
 						var returnReach = hall.Radius + worker.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-						Repath(worker, GetWorkerReturnPathTarget(worker, hall), returnReach, interactionAnchor: hall.Center);
+						Repath(worker, MovementTargetResolver.GetWorkerReturnPathTarget(worker, hall, worker.TargetResource), returnReach, interactionAnchor: hall.Center);
 						worker.SetState(UnitState.ReturnCargo);
 						return;
 					}
@@ -1390,896 +1405,23 @@ public sealed partial class GameSimulation
 		bool preserveExistingPathOnFailure = false,
 		Vector2? interactionAnchor = null)
 	{
-		var start = Map.WorldToTile(unit.Position);
-		var goal = Map.WorldToTile(worldTarget);
-		var goalRadiusTiles = int.Max(0, Mathf.CeilToInt(arrivalRadius / GameConstants.TileSize));
-		var anchor = interactionAnchor ?? worldTarget;
-		var allowStartAsGoal = arrivalRadius <= 0f || unit.Position.DistanceTo(anchor) <= arrivalRadius + 0.5f;
-		var previousPath = preserveExistingPathOnFailure ? new List<Vector2>(unit.Path) : null;
-		var previousDestination = unit.PathDestination;
-		var tilePenalty = BuildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
-		var tilePath = Pathfinder.FindPath(
-			Map,
-			start,
-			goal,
-			goalRadiusTiles,
-			unit.Id % 8,
-			tilePenalty,
-			allowStartAsGoal);
-		if (tilePath.Count == 0)
-		{
-			if (!allowStartAsGoal &&
-				TryBuildCloseRangeFallbackPath(unit, worldTarget, anchor, arrivalRadius, out var fallbackPath))
-			{
-				unit.SetPath(fallbackPath);
-				unit.PathDestination = worldTarget;
-				unit.PathRepathMs = 0d;
-				return true;
-			}
-
-			if (preserveExistingPathOnFailure && previousPath is not null)
-			{
-				unit.SetPath(previousPath);
-				unit.PathDestination = previousDestination;
-				return false;
-			}
-
-			unit.SetPath(Array.Empty<Vector2>());
-			unit.PathDestination = worldTarget;
-			unit.PathRepathMs = 0d;
-			return false;
-		}
-
-		var worldPath = new List<Vector2>(tilePath.Count);
-		foreach (var point in tilePath)
-		{
-			worldPath.Add(Map.TileToWorldCenter(point.X, point.Y));
-		}
-
-		unit.SetPath(worldPath);
-		unit.PathDestination = worldPath.Count > 0 ? worldPath[^1] : worldTarget;
-		unit.PathRepathMs = 0d;
-		if (stuckReroute)
-		{
-			unit.LastHeavyRerouteMs = _elapsedMs;
-		}
-
-		return true;
-	}
-
-	private bool TryBuildCloseRangeFallbackPath(
-		SimUnit unit,
-		Vector2 worldTarget,
-		Vector2 interactionAnchor,
-		float arrivalRadius,
-		out List<Vector2> path)
-	{
-		path = [];
-		if (arrivalRadius <= 0f)
-		{
-			return false;
-		}
-
-		var distance = unit.Position.DistanceTo(interactionAnchor);
-		if (distance > arrivalRadius + GameConstants.TileSize * 1.4f)
-		{
-			return false;
-		}
-
-		var direction = unit.Position - interactionAnchor;
-		if (direction.LengthSquared() <= 0.01f)
-		{
-			direction = unit.Position - worldTarget;
-			if (direction.LengthSquared() <= 0.01f)
-			{
-				direction = Vector2.Right;
-			}
-		}
-
-		var stopDistance = Mathf.Max(arrivalRadius * 0.9f, unit.Radius + 2f);
-		var candidate = interactionAnchor + direction.Normalized() * stopDistance;
-		if (!TryMoveToCandidate(unit, candidate, 1.5f))
-		{
-			return false;
-		}
-
-		path.Add(candidate);
-		return true;
-	}
-
-	private Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
-	{
-		var penalty = new Dictionary<int, float>();
-		var goalWorld = Map.TileToWorldCenter(goal.X, goal.Y);
-		foreach (var other in Units)
-		{
-			if (!other.Alive || other == unit)
-			{
-				continue;
-			}
-
-			if (other.Side != unit.Side)
-			{
-				continue;
-			}
-
-			var occupied = Map.WorldToTile(other.Position);
-			if (!Map.InBounds(occupied.X, occupied.Y))
-			{
-				continue;
-			}
-
-			var goalSlack = goalRadiusTiles + 1;
-			var nearGoal = Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack;
-			var sharedCombatTarget = SharesCombatTarget(unit, other);
-			if (!nearGoal || !sharedCombatTarget)
-			{
-				AddTilePenalty(penalty, occupied.X, occupied.Y, sharedCombatTarget ? SoftUnitNeighborTilePenalty : SoftUnitTilePenalty);
-				for (var dy = -1; dy <= 1; dy++)
-				{
-					for (var dx = -1; dx <= 1; dx++)
-					{
-						if ((dx == 0 && dy == 0) || !Map.InBounds(occupied.X + dx, occupied.Y + dy))
-						{
-							continue;
-						}
-
-						AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, SoftUnitNeighborTilePenalty);
-					}
-				}
-			}
-
-			if (!stuckReroute || !ShouldTreatAsTemporaryBlocker(unit, other, goalWorld, goalRadiusTiles))
-			{
-				continue;
-			}
-
-			AddTilePenalty(penalty, occupied.X, occupied.Y, StaticBlockerTilePenalty);
-			for (var dy = -1; dy <= 1; dy++)
-			{
-				for (var dx = -1; dx <= 1; dx++)
-				{
-					if ((dx == 0 && dy == 0) || !Map.InBounds(occupied.X + dx, occupied.Y + dy))
-					{
-						continue;
-					}
-
-					AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, StaticBlockerNeighborTilePenalty);
-				}
-			}
-		}
-
-		return penalty;
-	}
-
-	private bool ShouldTreatAsTemporaryBlocker(SimUnit mover, SimUnit other, Vector2 goalWorld, int goalRadiusTiles)
-	{
-		if (SharesCombatTarget(mover, other))
-		{
-			return false;
-		}
-
-		if (!IsLikelyStaticBlocker(other))
-		{
-			return false;
-		}
-
-		var corridorRadius = GameConstants.TileSize * 1.6f;
-		var nearGoalRadius = (goalRadiusTiles + 2f) * GameConstants.TileSize;
-		var nearGoal = other.Position.DistanceTo(goalWorld) <= nearGoalRadius;
-		var inCorridor = DistanceToSegment(other.Position, mover.Position, goalWorld) <= corridorRadius;
-		if (!nearGoal && !inCorridor)
-		{
-			return false;
-		}
-
-		if (mover.TargetResource is not null && other.TargetResource == mover.TargetResource)
-		{
-			return true;
-		}
-
-		if (mover.ReturnBuilding is not null && other.ReturnBuilding == mover.ReturnBuilding)
-		{
-			return true;
-		}
-
-		if (mover.TargetBuilding is not null && other.TargetBuilding == mover.TargetBuilding)
-		{
-			return true;
-		}
-
-		return nearGoal || inCorridor;
-	}
-
-	private static bool SharesCombatTarget(SimUnit first, SimUnit second)
-	{
-		return first.TargetCombat is not null &&
-			   first.TargetCombat == second.TargetCombat &&
-			   first.CanAttack() &&
-			   second.CanAttack();
-	}
-
-	private static bool IsLikelyStaticBlocker(SimUnit unit)
-	{
-		if (unit.State is UnitState.Attack or UnitState.Gather or UnitState.Build or UnitState.ReturnCargo)
-		{
-			return true;
-		}
-
-		if (unit.State is UnitState.Move or UnitState.AttackMove)
-		{
-			return unit.Path.Count == 0 || unit.StuckAccumMs >= 320d;
-		}
-
-		return unit.State == UnitState.Idle;
-	}
-
-	private static float DistanceToSegment(Vector2 point, Vector2 start, Vector2 end)
-	{
-		var segment = end - start;
-		var lengthSquared = segment.LengthSquared();
-		if (lengthSquared <= 0.01f)
-		{
-			return point.DistanceTo(start);
-		}
-
-		var t = Mathf.Clamp((point - start).Dot(segment) / lengthSquared, 0f, 1f);
-		var projection = start + segment * t;
-		return point.DistanceTo(projection);
-	}
-
-	private bool AdvanceAlongPathWithSteering(SimUnit unit, double delta)
-	{
-		if (!unit.Alive || unit.Path.Count == 0)
-		{
-			return false;
-		}
-
-		var step = unit.Speed * (float)delta;
-		var next = unit.Path[0];
-		var toNext = next - unit.Position;
-		var distance = toNext.Length();
-		if (distance <= step)
-		{
-			if (TryMoveToCandidate(unit, next, 1.5f))
-			{
-				unit.Position = next;
-				unit.Path.RemoveAt(0);
-				return unit.Path.Count > 0;
-			}
-
-			return TrySteeredAdvance(unit, distance <= 0.01f ? Vector2.Right : toNext / distance, step);
-		}
-
-		var direction = toNext / distance;
-		var direct = unit.Position + direction * step;
-		if (TryMoveToCandidate(unit, direct, 1.5f))
-		{
-			unit.Position = direct;
-			return true;
-		}
-
-		return TrySteeredAdvance(unit, direction, step);
-	}
-
-	private bool TrySteeredAdvance(SimUnit unit, Vector2 direction, float step)
-	{
-		if (direction.LengthSquared() <= 0.001f || step <= 0.01f)
-		{
-			return false;
-		}
-
-		var blocker = FindMovementBlocker(unit, unit.Position + direction * step, 1.5f);
-		if (blocker is null)
-		{
-			return false;
-		}
-
-		var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
-		var perpendicular = new Vector2(-direction.Y, direction.X);
-		var sideStep = Mathf.Clamp(step * CompactSideStepFactor, 2f, GameConstants.LocalAvoidanceStep * 0.8f);
-		var forwardBias = direction * Mathf.Min(step * CompactForwardBiasFactor, sideStep * 0.6f);
-		var offsets = new[]
-		{
-			forwardBias + perpendicular * preferredSide * sideStep,
-			forwardBias - perpendicular * preferredSide * sideStep
-		};
-
-		foreach (var offset in offsets)
-		{
-			var candidate = unit.Position + offset;
-			if (!TryMoveToCandidate(unit, candidate, 1.5f))
-			{
-				continue;
-			}
-
-			unit.Position = candidate;
-			return true;
-		}
-
-		return false;
-	}
-
-	private SimUnit? FindMovementBlocker(SimUnit unit, Vector2 candidate, float padding)
-	{
-		SimUnit? best = null;
-		var bestDistance = float.PositiveInfinity;
-		foreach (var other in Units)
-		{
-			if (!other.Alive || other == unit)
-			{
-				continue;
-			}
-
-			var minimum = unit.Radius + other.Radius + padding;
-			var distance = candidate.DistanceTo(other.Position);
-			if (distance >= minimum || distance >= bestDistance)
-			{
-				continue;
-			}
-
-			best = other;
-			bestDistance = distance;
-		}
-
-		return best;
-	}
-
-	private static float GetPreferredSteerSide(SimUnit unit, Vector2 direction, SimUnit? blocker)
-	{
-		if (blocker is null)
-		{
-			return unit.Id % 2 == 0 ? 1f : -1f;
-		}
-
-		var perpendicular = new Vector2(-direction.Y, direction.X);
-		var lateralDot = perpendicular.Dot(blocker.Position - unit.Position);
-		if (Mathf.Abs(lateralDot) <= 0.5f)
-		{
-			return unit.Id % 2 == 0 ? 1f : -1f;
-		}
-
-		return lateralDot > 0f ? -1f : 1f;
-	}
-
-	private bool TryBuildCombatApproachTarget(SimUnit unit, ICombatTarget target, out Vector2 approachTarget, out float arrivalRadius)
-	{
-		if (unit.IsRanged() || unit.IsSiege())
-		{
-			var rangedSlot = BuildRangedCombatApproachSlot(unit, target);
-			approachTarget = rangedSlot.Target;
-			arrivalRadius = rangedSlot.ArrivalRadius;
-			return true;
-		}
-
-		var meleeSlot = BuildMeleeCombatApproachSlot(unit, target);
-		approachTarget = meleeSlot.Target;
-		arrivalRadius = meleeSlot.ArrivalRadius;
-		return true;
-	}
-
-	private CombatApproachSlot BuildMeleeCombatApproachSlot(SimUnit unit, ICombatTarget target)
-	{
-		var forward = GetApproachDirection(unit, target);
-		var lateral = new Vector2(-forward.Y, forward.X);
-		var contactDistance = target.Radius + unit.Radius + Mathf.Max(unit.Range * 0.3f, 4f);
-		var contactCenter = target.Position + forward * contactDistance;
-		var contactSlots = target.IsBuilding
-			? Mathf.Clamp(Mathf.RoundToInt(target.Radius / 12f) + 2, 3, 6)
-			: Mathf.Clamp(Mathf.RoundToInt(target.Radius / 10f) + 1, 2, 4);
-		var rows = target.IsBuilding ? 3 : 2;
-		var assignment = Mathf.PosMod(unit.Id, contactSlots * rows);
-		var lane = CenteredSlotIndex(assignment % contactSlots);
-		var rank = assignment / contactSlots;
-		var laneSpacing = unit.Radius * 2f + 4f;
-		var followSpacing = unit.Radius * 2.1f + 6f;
-		var offset = lateral * (lane * laneSpacing) + forward * (rank * followSpacing);
-		var targetPoint = contactCenter + offset;
-		var arrival = Mathf.Max(unit.Radius * 0.6f, 7f);
-		return new CombatApproachSlot(targetPoint, arrival);
-	}
-
-	private CombatApproachSlot BuildRangedCombatApproachSlot(SimUnit unit, ICombatTarget target)
-	{
-		var forward = GetApproachDirection(unit, target);
-		var baseAngle = Mathf.Atan2(forward.Y, forward.X);
-		var desiredRadius = target.Radius + unit.Radius + Mathf.Max(unit.Range * 0.52f, GameConstants.TileSize * 0.35f);
-		var slotCount = target.IsBuilding ? 4 : 3;
-		var spread = target.IsBuilding ? 0.5f : 0.32f;
-		var ordinal = Mathf.PosMod(unit.Id, slotCount);
-		var t = slotCount == 1 ? 0.5f : ordinal / (float)(slotCount - 1);
-		var angle = baseAngle - spread * 0.5f + spread * t;
-		var offset = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * desiredRadius;
-		var targetPoint = target.Position + offset;
-		var arrival = Mathf.Max(unit.Radius * 0.7f, 8f);
-		return new CombatApproachSlot(targetPoint, arrival);
-	}
-
-	private static Vector2 GetApproachDirection(SimUnit unit, ICombatTarget target)
-	{
-		var direction = unit.Position - target.Position;
-		if (direction.LengthSquared() <= 1f)
-		{
-			var fallbackAngle = Mathf.Tau * (Mathf.PosMod(unit.Id, 8) / 8f);
-			return new Vector2(Mathf.Cos(fallbackAngle), Mathf.Sin(fallbackAngle));
-		}
-
-		return direction.Normalized();
-	}
-
-	private static int CenteredSlotIndex(int ordinal)
-	{
-		if (ordinal == 0)
-		{
-			return 0;
-		}
-
-		var step = (ordinal + 1) / 2;
-		return ordinal % 2 == 1 ? -step : step;
-	}
-
-	private bool TryMoveToCandidate(SimUnit unit, Vector2 candidate, float padding, SimUnit? ignoredUnit = null)
-	{
-		var tile = Map.WorldToTile(candidate);
-		if (!Map.IsWalkable(tile.X, tile.Y))
-		{
-			return false;
-		}
-
-		foreach (var other in Units)
-		{
-			if (!other.Alive || other == unit || other == ignoredUnit)
-			{
-				continue;
-			}
-
-			var minimum = unit.Radius + other.Radius + padding;
-			if (candidate.DistanceTo(other.Position) < minimum)
-			{
-				return false;
-			}
-		}
-
-		return true;
+		var request = new PathRequest(
+			worldTarget,
+			arrivalRadius,
+			interactionAnchor ?? worldTarget,
+			stuckReroute,
+			preserveExistingPathOnFailure);
+		return _unitPathService.Repath(unit, request, _elapsedMs);
 	}
 
 	private bool AdvanceWithRecovery(SimUnit unit, double delta)
 	{
-		if (!unit.Alive || unit.Path.Count == 0)
-		{
-			unit.StuckAccumMs = 0d;
-			unit.PathProgressStallMs = 0d;
-			unit.LastPathProgressMetric = float.PositiveInfinity;
-			return false;
-		}
-
-		UpdatePathProgressState(unit, delta);
-
-		var before = unit.Position;
-		var pathCountBefore = unit.Path.Count;
-		var expectedStep = unit.Speed * (float)delta;
-		var hasPath = AdvanceAlongPathWithSteering(unit, delta);
-		var moved = before.DistanceTo(unit.Position);
-		var reachedWaypoint = unit.Path.Count < pathCountBefore;
-		var movedEnough = moved >= float.Max(GameConstants.StuckMovedEpsilon, expectedStep * 0.18f);
-
-		if (!reachedWaypoint && !movedEnough)
-		{
-			unit.StuckAccumMs += delta * 1000d;
-		}
-		else
-		{
-			unit.StuckAccumMs = 0d;
-		}
-
-		var needsRecovery = hasPath && (unit.StuckAccumMs >= GameConstants.StuckRepathDelayMs ||
-										unit.PathProgressStallMs >= GameConstants.StuckRepathDelayMs);
-		if (needsRecovery)
-		{
-			var allowHeavyReroute = unit.StuckAccumMs >= HeavyRerouteTriggerMs ||
-									unit.PathProgressStallMs >= HeavyRerouteTriggerMs;
-			ResolveLocalStuck(unit, allowHeavyReroute);
-		}
-
-		return hasPath;
+		return _unitPathService.AdvanceWithRecovery(unit, delta, _elapsedMs);
 	}
 
-	private void UpdatePathProgressState(SimUnit unit, double delta)
+	private Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
 	{
-		var currentMetric = ComputePathProgressMetric(unit);
-		if (float.IsPositiveInfinity(unit.LastPathProgressMetric) ||
-			currentMetric + GameConstants.PathProgressImprovementEpsilon < unit.LastPathProgressMetric)
-		{
-			unit.LastPathProgressMetric = currentMetric;
-			unit.PathProgressStallMs = 0d;
-			return;
-		}
-
-		unit.PathProgressStallMs += delta * 1000d;
-	}
-
-	private static float ComputePathProgressMetric(SimUnit unit)
-	{
-		if (unit.Path.Count == 0)
-		{
-			return 0f;
-		}
-
-		var remaining = unit.Position.DistanceTo(unit.Path[0]);
-		for (var index = 1; index < unit.Path.Count; index++)
-		{
-			remaining += unit.Path[index - 1].DistanceTo(unit.Path[index]);
-		}
-
-		return remaining;
-	}
-
-	private void ResolveLocalStuck(SimUnit unit, bool allowHeavyReroute)
-	{
-		unit.StuckAccumMs = 0d;
-		unit.PathProgressStallMs = 0d;
-		if (TryLocalAvoidanceStep(unit))
-		{
-			return;
-		}
-
-		if (TryGetRepathTarget(unit, out var repathTarget, out var arrivalRadius, out var interactionAnchor))
-		{
-			if (Repath(unit, repathTarget, arrivalRadius, preserveExistingPathOnFailure: true, interactionAnchor: interactionAnchor))
-			{
-				return;
-			}
-
-			if (allowHeavyReroute && _elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
-			{
-				Repath(unit, repathTarget, arrivalRadius, stuckReroute: true, preserveExistingPathOnFailure: true, interactionAnchor: interactionAnchor);
-			}
-		}
-	}
-
-	private bool TryGetRepathTarget(SimUnit unit, out Vector2 target, out float arrivalRadius, out Vector2 interactionAnchor)
-	{
-		if (unit.TargetCombat is { Alive: true } combat)
-		{
-			if (TryBuildCombatApproachTarget(unit, combat, out target, out arrivalRadius))
-			{
-				interactionAnchor = combat.Position;
-				return true;
-			}
-
-			target = combat.Position;
-			arrivalRadius = GetAttackRange(unit, combat);
-			interactionAnchor = combat.Position;
-			return true;
-		}
-
-		if (unit.TargetResource is { Alive: true } resource)
-		{
-			target = GetWorkerGatherPathTarget(unit, resource);
-			arrivalRadius = resource.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-			interactionAnchor = resource.Center;
-			return true;
-		}
-
-		if (unit.ReturnBuilding is { Alive: true } hall)
-		{
-			target = GetWorkerReturnPathTarget(unit, hall);
-			arrivalRadius = hall.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-			interactionAnchor = hall.Center;
-			return true;
-		}
-
-		if (unit.TargetBuilding is { Alive: true } site)
-		{
-			target = site.Center;
-			arrivalRadius = site.Radius + unit.Radius + GameConstants.TileSize * GameConstants.GatherReachPaddingTiles;
-			interactionAnchor = site.Center;
-			return true;
-		}
-
-		if (unit.PathDestination.HasValue)
-		{
-			target = unit.PathDestination.Value;
-			arrivalRadius = 0f;
-			interactionAnchor = target;
-			return true;
-		}
-
-		target = Vector2.Zero;
-		arrivalRadius = 0f;
-		interactionAnchor = Vector2.Zero;
-		return false;
-	}
-
-	private Vector2 GetWorkerGatherPathTarget(SimUnit unit, SimResourceNode node)
-	{
-		if (!unit.IsWorker())
-		{
-			return node.Center;
-		}
-
-		var hall = unit.ReturnBuilding is { Alive: true } returnBuilding ? returnBuilding : FindNearestHall(unit);
-		if (hall is null)
-		{
-			return node.Center;
-		}
-
-		return TryBuildWorkerFlowTarget(unit.Id, hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: false, out var target)
-			? target
-			: node.Center;
-	}
-
-	private Vector2 GetWorkerReturnPathTarget(SimUnit unit, SimBuilding hall)
-	{
-		if (!unit.IsWorker())
-		{
-			return hall.Center;
-		}
-
-		if (unit.TargetResource is not { Alive: true } node)
-		{
-			return hall.Center;
-		}
-
-		return TryBuildWorkerFlowTarget(unit.Id, hall.Center, hall.Radius, node.Center, node.Radius, approachingHall: true, out var target)
-			? target
-			: hall.Center;
-	}
-
-	private static bool TryBuildWorkerFlowTarget(
-		int unitId,
-		Vector2 hallCenter,
-		float hallRadius,
-		Vector2 nodeCenter,
-		float nodeRadius,
-		bool approachingHall,
-		out Vector2 target)
-	{
-		var route = nodeCenter - hallCenter;
-		if (route.LengthSquared() <= 4f)
-		{
-			target = Vector2.Zero;
-			return false;
-		}
-
-		var routeDirection = route.Normalized();
-		var perpendicular = new Vector2(-routeDirection.Y, routeDirection.X);
-		var laneIndex = unitId % 5 - 2;
-		var laneOffset = perpendicular * (laneIndex * (GameConstants.WorkerFlowLaneOffset * 0.55f));
-
-		if (approachingHall)
-		{
-			var depth = hallRadius + GameConstants.TileSize * 0.35f + Mathf.Abs(laneIndex) * 1.5f;
-			target = hallCenter + routeDirection * depth - laneOffset;
-			return true;
-		}
-
-		var depthToNode = nodeRadius + GameConstants.TileSize * 0.28f + Mathf.Abs(laneIndex) * 1.2f;
-		target = nodeCenter - routeDirection * depthToNode + laneOffset;
-		return true;
-	}
-
-	private bool TryLocalAvoidanceStep(SimUnit unit)
-	{
-		if (unit.Path.Count == 0)
-		{
-			return false;
-		}
-
-		var direction = unit.Path[0] - unit.Position;
-		if (direction.LengthSquared() <= 0.01f)
-		{
-			return false;
-		}
-
-		direction = direction.Normalized();
-		var blocker = FindMovementBlocker(unit, unit.Position + direction * GameConstants.LocalAvoidanceStep, 1.5f);
-		var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
-		var perpendicular = new Vector2(-direction.Y, direction.X) * preferredSide;
-		var sideStep = GameConstants.LocalAvoidanceStep * 0.7f;
-		var offsets = new[]
-		{
-			perpendicular * sideStep,
-			-perpendicular * sideStep
-		};
-
-		foreach (var offset in offsets)
-		{
-			if (TryMoveIntoFreeSpace(unit, offset))
-			{
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	private bool TryMoveIntoFreeSpace(SimUnit unit, Vector2 offset)
-	{
-		var candidate = unit.Position + offset;
-		if (!TryMoveToCandidate(unit, candidate, 2f))
-		{
-			return false;
-		}
-
-		unit.Position = candidate;
-		return true;
-	}
-
-	private static void AddTilePenalty(Dictionary<int, float> penalty, int tx, int ty, float amount)
-	{
-		var key = ty * GameConstants.MapWidth + tx;
-		penalty[key] = penalty.GetValueOrDefault(key) + amount;
-	}
-
-	private void ApplySeparation(double delta)
-	{
-		var strength = Math.Min(1d, delta / 0.01667d) * 0.55d;
-		for (var i = 0; i < Units.Count; i++)
-		{
-			var first = Units[i];
-			if (!first.Alive)
-			{
-				continue;
-			}
-
-			for (var j = i + 1; j < Units.Count; j++)
-			{
-				var second = Units[j];
-				if (!second.Alive || second.Side != first.Side)
-				{
-					continue;
-				}
-
-				var minimum = first.Radius + second.Radius + 1.25f;
-				var deltaVector = second.Position - first.Position;
-				var distance = deltaVector.Length();
-				if (distance <= 0.01f || distance >= minimum)
-				{
-					continue;
-				}
-
-				if (TryResolveHeadOnDeadlock(first, second, deltaVector, minimum))
-				{
-					continue;
-				}
-
-				var overlap = minimum - distance;
-				if (overlap <= 0.2f)
-				{
-					continue;
-				}
-
-				var push = Mathf.Clamp((float)(overlap * 0.35f * strength), 0.2f, 1.4f);
-				var normal = deltaVector / distance;
-				TryNudge(first, -normal * push, second);
-				TryNudge(second, normal * push, first);
-			}
-		}
-	}
-
-	private bool TryResolveHeadOnDeadlock(SimUnit first, SimUnit second, Vector2 deltaVector, float minimum)
-	{
-		var firstDirection = GetPathTravelDirection(first);
-		var secondDirection = GetPathTravelDirection(second);
-		if (firstDirection == Vector2.Zero || secondDirection == Vector2.Zero)
-		{
-			return false;
-		}
-
-		if (firstDirection.Dot(secondDirection) > -0.45f)
-		{
-			return false;
-		}
-
-		var axis = deltaVector.Normalized();
-		var firstFacing = firstDirection.Dot(axis);
-		var secondFacing = secondDirection.Dot(-axis);
-		if (firstFacing < 0.35f || secondFacing < 0.35f)
-		{
-			return false;
-		}
-
-		var overlap = Mathf.Max(0f, minimum - deltaVector.Length());
-		if (overlap < GameConstants.DeadlockResolveMinOverlap || !IsDeadlockResolutionReady(first, second))
-		{
-			return false;
-		}
-
-		var leader = CompareMovementPriority(first, second) <= 0 ? first : second;
-		var yielder = leader == first ? second : first;
-		var leaderDirection = leader == first ? firstDirection : secondDirection;
-		var sideSign = yielder.Id % 2 == 0 ? 1f : -1f;
-		var lateral = new Vector2(-leaderDirection.Y, leaderDirection.X) * sideSign;
-		var yieldStep = Mathf.Clamp(
-			overlap * 0.32f + GameConstants.LocalAvoidanceStep * 0.12f,
-			GameConstants.DeadlockYieldMinStep * 0.8f,
-			GameConstants.DeadlockYieldMaxStep * 0.75f);
-		var offsets = new[]
-		{
-			lateral * yieldStep,
-			-lateral * yieldStep,
-			-leaderDirection * (yieldStep * 0.45f)
-		};
-
-		foreach (var offset in offsets)
-		{
-			if (!TryMoveIntoFreeSpace(yielder, offset))
-			{
-				continue;
-			}
-
-			yielder.StuckAccumMs = 0d;
-			yielder.PathProgressStallMs = 0d;
-			yielder.LastPathProgressMetric = float.PositiveInfinity;
-			return true;
-		}
-
-		return false;
-	}
-
-	private static bool IsDeadlockResolutionReady(SimUnit first, SimUnit second)
-	{
-		var triggerMs = GameConstants.DeadlockResolveTriggerMs;
-		var firstStalled = first.PathProgressStallMs >= triggerMs || first.StuckAccumMs >= triggerMs;
-		var secondStalled = second.PathProgressStallMs >= triggerMs || second.StuckAccumMs >= triggerMs;
-		return firstStalled && secondStalled;
-	}
-
-	private static Vector2 GetPathTravelDirection(SimUnit unit)
-	{
-		if (unit.Path.Count == 0)
-		{
-			return Vector2.Zero;
-		}
-
-		for (var index = 0; index < unit.Path.Count; index++)
-		{
-			var direction = unit.Path[index] - unit.Position;
-			if (direction.LengthSquared() > 1f)
-			{
-				return direction.Normalized();
-			}
-		}
-
-		return Vector2.Zero;
-	}
-
-	private static int CompareMovementPriority(SimUnit first, SimUnit second)
-	{
-		var firstPriority = GetMovementPriority(first);
-		var secondPriority = GetMovementPriority(second);
-		if (firstPriority != secondPriority)
-		{
-			return secondPriority.CompareTo(firstPriority);
-		}
-
-		return first.Id.CompareTo(second.Id);
-	}
-
-	private static int GetMovementPriority(SimUnit unit)
-	{
-		return unit.State switch
-		{
-			UnitState.Attack => 5,
-			UnitState.ReturnCargo => 4,
-			UnitState.Gather => 4,
-			UnitState.Build => 4,
-			UnitState.Move => 3,
-			UnitState.AttackMove => 3,
-			_ => 1
-		};
-	}
-
-	private void TryNudge(SimUnit unit, Vector2 offset, SimUnit? ignoredUnit = null)
-	{
-		var next = unit.Position + offset;
-		if (!TryMoveToCandidate(unit, next, 1f, ignoredUnit))
-		{
-			return;
-		}
-
-		unit.Position = next;
+		return _unitPathService.BuildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
 	}
 
 	private void FinishProduction(SimBuilding building, UnitKind kind)
