@@ -1003,7 +1003,7 @@ public partial class RtsGame : Node2D
             return;
         }
 
-        var slots = FormationSlots(units, worldPosition, occupiedCenter, occupiedRadius);
+        var slots = MatchUnitsToSlots(units, FormationSlots(units, worldPosition, occupiedCenter, occupiedRadius), worldPosition);
         _simulation.IssueMoveGroup(units, slots, worldPosition);
 
         _lastCommand = GameUiText.CommandMove(FormatVector(worldPosition));
@@ -1019,7 +1019,7 @@ public partial class RtsGame : Node2D
         }
 
         var units = GetControllableSelectedUnits();
-        var slots = FormationSlots(units, worldPosition);
+        var slots = MatchUnitsToSlots(units, FormationSlots(units, worldPosition), worldPosition);
         _simulation.IssueAttackMoveGroup(units, slots, worldPosition);
 
         _lastCommand = GameUiText.CommandAttackMove(FormatVector(worldPosition));
@@ -1111,6 +1111,84 @@ public partial class RtsGame : Node2D
         }
 
         return slots;
+    }
+
+    private static List<Vector2> MatchUnitsToSlots(IReadOnlyList<SimUnit> units, IReadOnlyList<Vector2> slots, Vector2 commandCenter)
+    {
+        if (units.Count == 0 || units.Count != slots.Count)
+        {
+            return new List<Vector2>(slots);
+        }
+
+        var centroid = ComputeUnitCentroid(units);
+        var forward = commandCenter - centroid;
+        if (forward.LengthSquared() <= 1f)
+        {
+            forward = Vector2.Down;
+        }
+
+        forward = forward.Normalized();
+        var lateral = new Vector2(-forward.Y, forward.X);
+        var rankedUnits = new List<(int Index, float Forward, float Lateral, float Distance)>(units.Count);
+        var rankedSlots = new List<(Vector2 Slot, float Forward, float Lateral, float Distance)>(slots.Count);
+        for (var index = 0; index < units.Count; index++)
+        {
+            var unitOffset = units[index].Position - centroid;
+            rankedUnits.Add((
+                index,
+                forward.Dot(unitOffset),
+                lateral.Dot(unitOffset),
+                units[index].Position.DistanceTo(commandCenter)));
+
+            var slotOffset = slots[index] - commandCenter;
+            rankedSlots.Add((
+                slots[index],
+                forward.Dot(slotOffset),
+                lateral.Dot(slotOffset),
+                slots[index].DistanceTo(commandCenter)));
+        }
+
+        rankedUnits.Sort(static (left, right) =>
+        {
+            var rowCompare = right.Forward.CompareTo(left.Forward);
+            if (rowCompare != 0)
+            {
+                return rowCompare;
+            }
+
+            var colCompare = left.Lateral.CompareTo(right.Lateral);
+            if (colCompare != 0)
+            {
+                return colCompare;
+            }
+
+            return left.Distance.CompareTo(right.Distance);
+        });
+
+        rankedSlots.Sort(static (left, right) =>
+        {
+            var rowCompare = right.Forward.CompareTo(left.Forward);
+            if (rowCompare != 0)
+            {
+                return rowCompare;
+            }
+
+            var colCompare = left.Lateral.CompareTo(right.Lateral);
+            if (colCompare != 0)
+            {
+                return colCompare;
+            }
+
+            return left.Distance.CompareTo(right.Distance);
+        });
+
+        var assigned = new Vector2[units.Count];
+        for (var index = 0; index < rankedUnits.Count; index++)
+        {
+            assigned[rankedUnits[index].Index] = rankedSlots[index].Slot;
+        }
+
+        return new List<Vector2>(assigned);
     }
 
     private static List<Vector2> BuildOccupiedFormationSlots(IReadOnlyList<SimUnit> units, Vector2 clickPosition, Vector2 occupiedCenter, float occupiedRadius)
@@ -1867,7 +1945,42 @@ public partial class RtsGame : Node2D
             Engine.GetFramesPerSecond(),
             _ticksPerSecond,
             _simulationTickCount);
+        var debugUnit = GetPrimaryDebugUnit();
+        if (debugUnit is not null)
+        {
+            var cohort = debugUnit.HasMovementCohort
+                ? $"{debugUnit.MovementCohortId}:{debugUnit.MovementCohortIndex + 1}/{debugUnit.MovementCohortCount}"
+                : "none";
+            var movementMode = debugUnit.HasMovementCohort
+                ? (debugUnit.IsInTerminalFormation
+                    ? (debugUnit.UsedCongestionTerminalSwitch ? "terminal*" : "terminal")
+                    : "shared")
+                : "solo";
+            text += "\n" + GameUiText.DebugUnitMovement(
+                debugUnit.Id,
+                cohort,
+                movementMode,
+                debugUnit.Path.Count,
+                (int)Math.Round(debugUnit.StuckAccumMs),
+                (int)Math.Round(debugUnit.PathProgressStallMs),
+                GameUiText.MovementRecoveryLabel(debugUnit.LastRecoveryKind),
+                debugUnit.IsUsingAllyPassThrough);
+        }
+
         _hud.UpdateDebugOverlay(_debugModeEnabled, text);
+    }
+
+    private SimUnit? GetPrimaryDebugUnit()
+    {
+        foreach (var unit in _selectedUnits)
+        {
+            if (unit.Alive)
+            {
+                return unit;
+            }
+        }
+
+        return null;
     }
 
     private bool IsPointerOverHud()

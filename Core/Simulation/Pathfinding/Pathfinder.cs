@@ -73,9 +73,10 @@ public static class Pathfinder
             open.Enqueue(startKey, Heuristic(start, actualGoals));
 
             var iterations = 0;
+            var maxIterations = Math.Max(4000, mapCellCount * 2);
             while (open.Count > 0)
             {
-                if (++iterations > 4000)
+                if (++iterations > maxIterations)
                 {
                     break;
                 }

@@ -31,6 +31,8 @@ public static class GameConstants
 	public const float GroupSpacing = 34f;
 	public const float RepathIntervalMs = 500f;
 	public const float StuckRepathDelayMs = 650f;
+	public const float AllyPassThroughDelayMs = 200f;
+	public const float AllyPassThroughHoldMs = 240f;
 	public const float StuckMovedEpsilon = 0.2f;
 	public const float PathProgressImprovementEpsilon = 4f;
 	public const float LocalAvoidanceStep = 8f;

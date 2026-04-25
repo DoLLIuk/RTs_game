@@ -35,6 +35,20 @@ public enum WorkerDefenseMode
     BaseDefenseCombat
 }
 
+public enum MovementRecoveryKind
+{
+    None,
+    LocalAvoidance,
+    HeadOnAvoidance,
+    CohortLaneChange,
+    CohortFollow,
+    AllyPassThrough,
+    CongestionSwitch,
+    LightRepath,
+    HeavyReroute,
+    StaticSlide
+}
+
 public sealed class SimUnit : ICombatTarget
 {
     public SimUnit(int id, UnitKind kind, GameSide side, Race race, Vector2 startPosition)
@@ -95,13 +109,19 @@ public sealed class SimUnit : ICombatTarget
     public int MovementCohortId { get; set; }
     public int MovementCohortIndex { get; set; }
     public int MovementCohortCount { get; set; }
+    public float SharedMoveArrivalRadius { get; set; }
+    public float CohortLaneBias { get; set; }
     public bool UseTerminalFormation { get; set; }
     public bool IsInTerminalFormation { get; set; }
+    public bool UsedCongestionTerminalSwitch { get; set; }
     public double PathRepathMs { get; set; }
     public double StuckAccumMs { get; set; }
     public double PathProgressStallMs { get; set; }
     public double LastHeavyRerouteMs { get; set; } = -99999d;
     public float LastPathProgressMetric { get; set; } = float.PositiveInfinity;
+    public MovementRecoveryKind LastRecoveryKind { get; set; }
+    public bool IsUsingAllyPassThrough { get; set; }
+    public double AllyPassThroughTimerMs { get; set; }
     public double LastAttackMs { get; set; }
     public ICombatTarget? TargetCombat { get; set; }
     public SimResourceNode? TargetResource { get; set; }
@@ -155,6 +175,10 @@ public sealed class SimUnit : ICombatTarget
             PathProgressStallMs = 0d;
             LastHeavyRerouteMs = -99999d;
             LastPathProgressMetric = float.PositiveInfinity;
+            LastRecoveryKind = MovementRecoveryKind.None;
+            IsUsingAllyPassThrough = false;
+            AllyPassThroughTimerMs = 0d;
+            UsedCongestionTerminalSwitch = false;
         }
     }
 
@@ -172,6 +196,10 @@ public sealed class SimUnit : ICombatTarget
         PathProgressStallMs = 0d;
         LastHeavyRerouteMs = -99999d;
         LastPathProgressMetric = float.PositiveInfinity;
+        LastRecoveryKind = MovementRecoveryKind.None;
+        IsUsingAllyPassThrough = false;
+        AllyPassThroughTimerMs = 0d;
+        UsedCongestionTerminalSwitch = false;
         TargetCombat = null;
         TargetResource = null;
         TargetBuilding = null;
@@ -301,15 +329,20 @@ public sealed class SimUnit : ICombatTarget
         int cohortCount,
         Vector2 sharedMoveTarget,
         Vector2 finalMoveTarget,
-        bool useTerminalFormation)
+        bool useTerminalFormation,
+        float sharedMoveArrivalRadius,
+        float cohortLaneBias)
     {
         MovementCohortId = cohortId;
         MovementCohortIndex = cohortIndex;
         MovementCohortCount = cohortCount;
         SharedMoveTarget = sharedMoveTarget;
         FinalMoveTarget = finalMoveTarget;
+        SharedMoveArrivalRadius = sharedMoveArrivalRadius;
+        CohortLaneBias = cohortLaneBias;
         UseTerminalFormation = useTerminalFormation;
         IsInTerminalFormation = !useTerminalFormation;
+        UsedCongestionTerminalSwitch = false;
     }
 
     public void ClearMovementCohort()
@@ -319,7 +352,10 @@ public sealed class SimUnit : ICombatTarget
         MovementCohortId = 0;
         MovementCohortIndex = 0;
         MovementCohortCount = 0;
+        SharedMoveArrivalRadius = 0f;
+        CohortLaneBias = 0f;
         UseTerminalFormation = false;
         IsInTerminalFormation = false;
+        UsedCongestionTerminalSwitch = false;
     }
 }

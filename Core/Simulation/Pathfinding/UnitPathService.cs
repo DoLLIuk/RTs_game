@@ -14,8 +14,14 @@ public sealed class UnitPathService
     private const float HeavyRerouteCooldownMs = 650f;
     private const float HeavyRerouteTriggerMs = 1100f;
     private const float CohortBlockerStallMs = 260f;
+    private const float CongestionTerminalSwitchMs = 240f;
+    private const float MoveUnitTilePenalty = 0.55f;
+    private const float MoveUnitNeighborTilePenalty = 0.09f;
     private const float SoftUnitTilePenalty = 0.85f;
     private const float SoftUnitNeighborTilePenalty = 0.12f;
+    private const float SharedCohortTilePenalty = 0.2f;
+    private const float SharedCohortNeighborTilePenalty = 0.05f;
+    private const float CorridorAheadPenalty = 0.32f;
     private const float StaticBlockerTilePenalty = 28f;
     private const float StaticBlockerNeighborTilePenalty = 4.5f;
 
@@ -54,7 +60,7 @@ public sealed class UnitPathService
         var previousPath = request.PreserveExistingPathOnFailure ? new List<Vector2>(unit.Path) : null;
         var previousDestination = unit.PathDestination;
         var tilePenalty = BuildDynamicPenaltyMap(unit, goal, goalRadiusTiles, request.StuckReroute);
-        var tieBreakerSeed = UseSharedCorridorSeed(unit) ? unit.MovementCohortId : unit.Id % 8;
+        var tieBreakerSeed = GetPathTieBreakerSeed(unit);
         var tilePath = Pathfinder.FindPath(
             _map,
             start,
@@ -105,11 +111,14 @@ public sealed class UnitPathService
 
     public bool AdvanceWithRecovery(SimUnit unit, double delta, double elapsedMs)
     {
+        UpdateAllyPassThroughState(unit, delta);
         if (!unit.Alive)
         {
             unit.StuckAccumMs = 0d;
             unit.PathProgressStallMs = 0d;
             unit.LastPathProgressMetric = float.PositiveInfinity;
+            unit.IsUsingAllyPassThrough = false;
+            unit.AllyPassThroughTimerMs = 0d;
             return false;
         }
 
@@ -123,6 +132,8 @@ public sealed class UnitPathService
             unit.StuckAccumMs = 0d;
             unit.PathProgressStallMs = 0d;
             unit.LastPathProgressMetric = float.PositiveInfinity;
+            unit.IsUsingAllyPassThrough = false;
+            unit.AllyPassThroughTimerMs = 0d;
             return false;
         }
 
@@ -155,6 +166,22 @@ public sealed class UnitPathService
         }
 
         return hasPath;
+    }
+
+    private static void UpdateAllyPassThroughState(SimUnit unit, double delta)
+    {
+        if (unit.AllyPassThroughTimerMs <= 0d)
+        {
+            unit.IsUsingAllyPassThrough = false;
+            unit.AllyPassThroughTimerMs = 0d;
+            return;
+        }
+
+        unit.AllyPassThroughTimerMs = Math.Max(0d, unit.AllyPassThroughTimerMs - delta * 1000d);
+        if (unit.AllyPassThroughTimerMs <= 0d)
+        {
+            unit.IsUsingAllyPassThrough = false;
+        }
     }
 
     public Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
@@ -226,6 +253,11 @@ public sealed class UnitPathService
             return;
         }
 
+        if (TryPromoteToTerminalFormation(unit, elapsedMs, allowCongestion: true))
+        {
+            return;
+        }
+
         if (!TryGetRepathRequest(unit, out var request))
         {
             return;
@@ -234,13 +266,17 @@ public sealed class UnitPathService
         var lightRequest = request with { PreserveExistingPathOnFailure = true };
         if (Repath(unit, lightRequest, elapsedMs))
         {
+            unit.LastRecoveryKind = MovementRecoveryKind.LightRepath;
             return;
         }
 
         if (allowHeavyReroute && elapsedMs - unit.LastHeavyRerouteMs >= HeavyRerouteCooldownMs)
         {
             var heavyRequest = request with { StuckReroute = true, PreserveExistingPathOnFailure = true };
-            Repath(unit, heavyRequest, elapsedMs);
+            if (Repath(unit, heavyRequest, elapsedMs))
+            {
+                unit.LastRecoveryKind = MovementRecoveryKind.HeavyReroute;
+            }
         }
     }
 
@@ -316,7 +352,9 @@ public sealed class UnitPathService
 
     private bool TryRefreshMovePath(SimUnit unit, double elapsedMs)
     {
-        TryPromoteToTerminalFormation(unit, elapsedMs);
+        var allowCongestionSwitch = unit.StuckAccumMs >= CongestionTerminalSwitchMs ||
+                                    unit.PathProgressStallMs >= CongestionTerminalSwitchMs;
+        TryPromoteToTerminalFormation(unit, elapsedMs, allowCongestionSwitch);
         if (unit.Path.Count > 0)
         {
             return true;
@@ -333,13 +371,19 @@ public sealed class UnitPathService
     private Dictionary<int, float> BuildDynamicPenaltyMap(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
     {
         var hasCombatTarget = unit.TargetCombat is { Alive: true };
-        if (!stuckReroute && !hasCombatTarget)
+        var wantsTrafficShaping = stuckReroute ||
+                                  hasCombatTarget ||
+                                  unit.State is UnitState.Move or UnitState.AttackMove ||
+                                  unit.HasMovementCohort;
+        if (!wantsTrafficShaping)
         {
             return [];
         }
 
         var penalty = new Dictionary<int, float>();
         var goalWorld = _map.TileToWorldCenter(goal.X, goal.Y);
+        var travelDirection = GetTravelDirection(unit, goalWorld);
+        var corridorRadius = Mathf.Max(GameConstants.TileSize * 1.2f, GameConstants.GroupSpacing * 0.9f);
         foreach (var other in _units)
         {
             if (!other.Alive || other == unit || other.Side != unit.Side)
@@ -357,20 +401,40 @@ public sealed class UnitPathService
             var nearGoal = Mathf.Abs(occupied.X - goal.X) <= goalSlack && Mathf.Abs(occupied.Y - goal.Y) <= goalSlack;
             var sharedCombatTarget = SharesCombatTarget(unit, other);
             var sharedMarchCohort = SharesMarchingCohort(unit, other);
+            var aheadInCorridor = travelDirection != Vector2.Zero &&
+                                  travelDirection.Dot(other.Position - unit.Position) > GameConstants.TileSize * 0.15f &&
+                                  DistanceToSegment(other.Position, unit.Position, goalWorld) <= corridorRadius;
+            var centerPenalty = 0f;
+            var neighborPenalty = 0f;
+            if (sharedMarchCohort)
+            {
+                centerPenalty = SharedCohortTilePenalty;
+                neighborPenalty = SharedCohortNeighborTilePenalty;
+            }
+            else if (unit.State is UnitState.Move or UnitState.AttackMove || hasCombatTarget)
+            {
+                centerPenalty = MoveUnitTilePenalty;
+                neighborPenalty = MoveUnitNeighborTilePenalty;
+            }
+
             if (hasCombatTarget && (!nearGoal || !sharedCombatTarget) && !sharedMarchCohort)
             {
-                AddTilePenalty(penalty, occupied.X, occupied.Y, sharedCombatTarget ? SoftUnitNeighborTilePenalty : SoftUnitTilePenalty);
-                for (var dy = -1; dy <= 1; dy++)
-                {
-                    for (var dx = -1; dx <= 1; dx++)
-                    {
-                        if ((dx == 0 && dy == 0) || !_map.InBounds(occupied.X + dx, occupied.Y + dy))
-                        {
-                            continue;
-                        }
+                centerPenalty = Mathf.Max(centerPenalty, sharedCombatTarget ? SoftUnitNeighborTilePenalty : SoftUnitTilePenalty);
+                neighborPenalty = Mathf.Max(neighborPenalty, SoftUnitNeighborTilePenalty);
+            }
 
-                        AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, SoftUnitNeighborTilePenalty);
-                    }
+            if (centerPenalty > 0f)
+            {
+                if (aheadInCorridor)
+                {
+                    centerPenalty += CorridorAheadPenalty;
+                    neighborPenalty += CorridorAheadPenalty * 0.18f;
+                }
+
+                centerPenalty += GetLaneBiasPenalty(unit, other, travelDirection, aheadInCorridor);
+                if (!nearGoal || !sharedMarchCohort)
+                {
+                    AddPenaltyBrush(penalty, occupied.X, occupied.Y, centerPenalty, neighborPenalty);
                 }
             }
 
@@ -379,19 +443,7 @@ public sealed class UnitPathService
                 continue;
             }
 
-            AddTilePenalty(penalty, occupied.X, occupied.Y, StaticBlockerTilePenalty);
-            for (var dy = -1; dy <= 1; dy++)
-            {
-                for (var dx = -1; dx <= 1; dx++)
-                {
-                    if ((dx == 0 && dy == 0) || !_map.InBounds(occupied.X + dx, occupied.Y + dy))
-                    {
-                        continue;
-                    }
-
-                    AddTilePenalty(penalty, occupied.X + dx, occupied.Y + dy, StaticBlockerNeighborTilePenalty);
-                }
-            }
+            AddPenaltyBrush(penalty, occupied.X, occupied.Y, StaticBlockerTilePenalty, StaticBlockerNeighborTilePenalty);
         }
 
         return penalty;
@@ -464,7 +516,7 @@ public sealed class UnitPathService
         return new PathRequest(zone.ZoneCenter, zone.ArrivalRadius, zone.InteractionAnchor);
     }
 
-    private bool TryPromoteToTerminalFormation(SimUnit unit, double elapsedMs)
+    private bool TryPromoteToTerminalFormation(SimUnit unit, double elapsedMs, bool allowCongestion)
     {
         if (!unit.HasMovementCohort ||
             !unit.UseTerminalFormation ||
@@ -481,14 +533,36 @@ public sealed class UnitPathService
         var nearSharedTarget = unit.Position.DistanceTo(sharedTarget) <= activationDistance;
         var localDirectPath = unit.Position.DistanceTo(finalTarget) <= activationDistance * 1.25f &&
                               _localMovement.HasDirectStaticPath(unit.Position, finalTarget, unit.Radius + 1.5f);
-        if (!nearSharedTarget && !localDirectPath)
+        var congestionSwitch = allowCongestion &&
+                               !unit.IsInTerminalFormation &&
+                               _localMovement.HasDirectStaticPath(unit.Position, finalTarget, unit.Radius + 1.5f) &&
+                               (unit.StuckAccumMs >= CongestionTerminalSwitchMs ||
+                                unit.PathProgressStallMs >= CongestionTerminalSwitchMs);
+        if (!nearSharedTarget && !localDirectPath && !congestionSwitch)
         {
             return false;
         }
 
         unit.IsInTerminalFormation = true;
+        unit.UsedCongestionTerminalSwitch = congestionSwitch;
         Repath(unit, new PathRequest(finalTarget, 0f, finalTarget, PreserveExistingPathOnFailure: true), elapsedMs);
+        if (congestionSwitch)
+        {
+            unit.LastRecoveryKind = MovementRecoveryKind.CongestionSwitch;
+        }
+
         return true;
+    }
+
+    private static int GetPathTieBreakerSeed(SimUnit unit)
+    {
+        if (!UseSharedCorridorSeed(unit))
+        {
+            return unit.Id % 17;
+        }
+
+        var laneBucket = Mathf.RoundToInt(unit.CohortLaneBias * 10f);
+        return unit.MovementCohortId * 31 + unit.MovementCohortIndex * 17 + laneBucket * 13 + unit.Id % 7;
     }
 
     private static bool UseSharedCorridorSeed(SimUnit unit)
@@ -558,6 +632,59 @@ public sealed class UnitPathService
     {
         var key = ty * GameConstants.MapWidth + tx;
         penalty[key] = penalty.GetValueOrDefault(key) + amount;
+    }
+
+    private void AddPenaltyBrush(Dictionary<int, float> penalty, int tx, int ty, float centerPenalty, float neighborPenalty)
+    {
+        AddTilePenalty(penalty, tx, ty, centerPenalty);
+        for (var dy = -1; dy <= 1; dy++)
+        {
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if ((dx == 0 && dy == 0) || !_map.InBounds(tx + dx, ty + dy))
+                {
+                    continue;
+                }
+
+                AddTilePenalty(penalty, tx + dx, ty + dy, neighborPenalty);
+            }
+        }
+    }
+
+    private static Vector2 GetTravelDirection(SimUnit unit, Vector2 goalWorld)
+    {
+        var direction = goalWorld - unit.Position;
+        if (direction.LengthSquared() <= 1f && unit.Path.Count > 0)
+        {
+            direction = unit.Path[0] - unit.Position;
+        }
+
+        if (direction.LengthSquared() <= 1f && unit.FinalMoveTarget.HasValue)
+        {
+            direction = unit.FinalMoveTarget.Value - unit.Position;
+        }
+
+        return direction.LengthSquared() <= 1f ? Vector2.Zero : direction.Normalized();
+    }
+
+    private static float GetLaneBiasPenalty(SimUnit unit, SimUnit other, Vector2 travelDirection, bool aheadInCorridor)
+    {
+        if (!aheadInCorridor ||
+            travelDirection == Vector2.Zero ||
+            !SharesMarchingCohort(unit, other) ||
+            Mathf.Abs(unit.CohortLaneBias) <= 0.05f)
+        {
+            return 0f;
+        }
+
+        var lateral = new Vector2(-travelDirection.Y, travelDirection.X);
+        var otherLaneOffset = lateral.Dot(other.Position - unit.Position);
+        if (unit.CohortLaneBias * otherLaneOffset <= 0f)
+        {
+            return 0f;
+        }
+
+        return 0.08f + Mathf.Min(0.2f, Mathf.Abs(unit.CohortLaneBias) * 0.06f);
     }
 
     private static float GetStaticApproachArrivalRadius(SimUnit unit)

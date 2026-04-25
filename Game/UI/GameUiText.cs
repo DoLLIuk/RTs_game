@@ -205,6 +205,21 @@ internal static class GameUiText
         _ => "Ожидает команды."
     };
 
+    public static string MovementRecoveryLabel(MovementRecoveryKind kind) => kind switch
+    {
+        MovementRecoveryKind.None => "none",
+        MovementRecoveryKind.LocalAvoidance => "avoid",
+        MovementRecoveryKind.HeadOnAvoidance => "head-on",
+        MovementRecoveryKind.CohortLaneChange => "lane-change",
+        MovementRecoveryKind.CohortFollow => "follow",
+        MovementRecoveryKind.AllyPassThrough => "phase-through",
+        MovementRecoveryKind.CongestionSwitch => "terminal-switch",
+        MovementRecoveryKind.LightRepath => "repath",
+        MovementRecoveryKind.HeavyReroute => "heavy-reroute",
+        MovementRecoveryKind.StaticSlide => "slide",
+        _ => kind.ToString()
+    };
+
     public static string UnitRole(UnitKind kind) => kind switch
     {
         UnitKind.Worker => "Рабочий развивает экономику, возводит здания и чинит базу.",
@@ -284,6 +299,11 @@ internal static class GameUiText
     public static string ActivityLine(string lastCommand, string hovered, Vector2I hoveredTile, string mode, string winner)
     {
         return $"Последний приказ: {lastCommand}  |  Наведение: {hovered}  |  Тайл: {hoveredTile.X},{hoveredTile.Y}  |  Режим: {mode}  |  Победитель: {winner}";
+    }
+
+    public static string DebugUnitMovement(int unitId, string cohort, string movementMode, int pathCount, int stuckMs, int stallMs, string recovery, bool passThroughActive)
+    {
+        return $"Unit #{unitId}  |  cohort: {cohort}  |  mode: {movementMode}  |  path: {pathCount}  |  stuck: {stuckMs}ms  |  stall: {stallMs}ms  |  recovery: {recovery}  |  pass-through: {(passThroughActive ? "on" : "off")}";
     }
 
     public static string QueueLead(string unitLabel, int progressPercent) => $"{unitLabel}: {progressPercent}%.";

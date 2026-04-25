@@ -291,10 +291,28 @@ public sealed partial class GameSimulation
 			return;
 		}
 
+		var cohortCenter = Vector2.Zero;
+		for (var index = 0; index < cohortUnits.Count; index++)
+		{
+			cohortCenter += cohortUnits[index].Position;
+		}
+
+		cohortCenter /= cohortUnits.Count;
+		var sharedArrivalRadius = ComputeSharedMoveArrivalRadius(cohortTargets, sharedWorldTarget);
 		var cohortId = _nextMovementCohortId++;
 		for (var index = 0; index < cohortUnits.Count; index++)
 		{
-			IssueGroupedMove(cohortUnits[index], sharedWorldTarget, cohortTargets[index], cohortId, index, cohortUnits.Count, attackMove);
+			var laneBias = ComputeCohortLaneBias(cohortCenter, sharedWorldTarget, cohortTargets[index]);
+			IssueGroupedMove(
+				cohortUnits[index],
+				sharedWorldTarget,
+				cohortTargets[index],
+				cohortId,
+				index,
+				cohortUnits.Count,
+				attackMove,
+				sharedArrivalRadius,
+				laneBias);
 		}
 	}
 
@@ -398,20 +416,65 @@ public sealed partial class GameSimulation
 		int cohortId,
 		int cohortIndex,
 		int cohortCount,
-		bool attackMove)
+		bool attackMove,
+		float sharedArrivalRadius,
+		float cohortLaneBias)
 	{
 		unit.ClearOrders();
-		unit.AssignMovementCohort(cohortId, cohortIndex, cohortCount, sharedWorldTarget, finalWorldTarget, useTerminalFormation: true);
+		unit.AssignMovementCohort(
+			cohortId,
+			cohortIndex,
+			cohortCount,
+			sharedWorldTarget,
+			finalWorldTarget,
+			useTerminalFormation: true,
+			sharedArrivalRadius,
+			cohortLaneBias);
 		if (attackMove)
 		{
 			unit.AttackMoveTarget = finalWorldTarget;
 		}
 
 		var initialTarget = unit.SharedMoveTarget ?? sharedWorldTarget;
-		Repath(unit, initialTarget, 0f);
+		Repath(unit, initialTarget, sharedArrivalRadius);
 		unit.SetState(unit.Path.Count > 0
 			? (attackMove ? UnitState.AttackMove : UnitState.Move)
 			: UnitState.Idle);
+	}
+
+	private static float ComputeSharedMoveArrivalRadius(IReadOnlyList<Vector2> finalTargets, Vector2 sharedWorldTarget)
+	{
+		if (finalTargets.Count <= 1)
+		{
+			return 0f;
+		}
+
+		var maxDistance = 0f;
+		for (var index = 0; index < finalTargets.Count; index++)
+		{
+			maxDistance = Mathf.Max(maxDistance, finalTargets[index].DistanceTo(sharedWorldTarget));
+		}
+
+		return Mathf.Max(GameConstants.GroupSpacing * 0.7f, maxDistance + GameConstants.TileSize * 0.4f);
+	}
+
+	private static float ComputeCohortLaneBias(Vector2 cohortCenter, Vector2 sharedWorldTarget, Vector2 finalWorldTarget)
+	{
+		var forward = sharedWorldTarget - cohortCenter;
+		if (forward.LengthSquared() <= 1f)
+		{
+			forward = finalWorldTarget - sharedWorldTarget;
+		}
+
+		if (forward.LengthSquared() <= 1f)
+		{
+			return 0f;
+		}
+
+		forward = forward.Normalized();
+		var lateral = new Vector2(-forward.Y, forward.X);
+		var laneOffset = lateral.Dot(finalWorldTarget - sharedWorldTarget);
+		return Mathf.Clamp(laneOffset / Mathf.Max(GameConstants.GroupSpacing, 1f), -2.4f, 2.4f);
 	}
 
 	public BuildingPlacementResult EvaluateBuildingPlacement(GameSide side, BuildingKind kind, Vector2I tilePosition)

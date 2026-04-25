@@ -9,6 +9,8 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 public sealed class UnitSeparationService
 {
     private const float SharedInteractionSeparationFactor = 0.55f;
+    private const float SharedMarchCohortSeparationFactor = 0.48f;
+    private const float AllyPassThroughSeparationFactor = 0.24f;
     private readonly List<SimUnit> _units;
     private readonly LocalMovementService _localMovement;
     private readonly List<SimUnit> _nearbyUnits = [];
@@ -39,15 +41,28 @@ public sealed class UnitSeparationService
                     continue;
                 }
 
-                if (SharesActiveMarchCohort(first, second))
+                var sharedMarchCohort = SharesActiveMarchCohort(first, second);
+                var allyPassThrough = first.IsUsingAllyPassThrough || second.IsUsingAllyPassThrough;
+                var minimum = first.Radius + second.Radius + 1.25f;
+                if (sharedMarchCohort)
                 {
-                    continue;
+                    minimum *= 0.72f;
+                }
+                else if (allyPassThrough)
+                {
+                    minimum *= 0.34f;
                 }
 
-                var minimum = first.Radius + second.Radius + 1.25f;
                 var deltaVector = second.Position - first.Position;
                 var distance = deltaVector.Length();
-                if (distance <= 0.01f || distance >= minimum)
+                if (distance <= 0.01f)
+                {
+                    var angle = Mathf.PosMod((first.Id * 0.73f) + (second.Id * 1.17f), Mathf.Tau);
+                    deltaVector = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
+                    distance = 0.01f;
+                }
+
+                if (distance >= minimum)
                 {
                     continue;
                 }
@@ -72,6 +87,19 @@ public sealed class UnitSeparationService
                 var pushFactor = TryGetSharedInteractionAnchor(first, second, out _, out _) ?
                     SharedInteractionSeparationFactor :
                     1f;
+                if (sharedMarchCohort)
+                {
+                    var stalledCluster = first.StuckAccumMs >= 120d ||
+                                         second.StuckAccumMs >= 120d ||
+                                         first.PathProgressStallMs >= 120d ||
+                                         second.PathProgressStallMs >= 120d;
+                    pushFactor *= stalledCluster ? 0.82f : SharedMarchCohortSeparationFactor;
+                }
+                else if (allyPassThrough)
+                {
+                    pushFactor *= AllyPassThroughSeparationFactor;
+                }
+
                 var overlapPressure = Mathf.Clamp(softOverlap / (minimum * 0.45f), 0f, 1f);
                 var push = Mathf.Clamp(
                     (float)(softOverlap * (0.12f + overlapPressure * 0.09f) * strength * pushFactor),
@@ -115,12 +143,13 @@ public sealed class UnitSeparationService
         var leader = CompareMovementPriority(first, second) <= 0 ? first : second;
         var yielder = leader == first ? second : first;
         var leaderDirection = leader == first ? firstDirection : secondDirection;
-        var sideSign = yielder.Id % 2 == 0 ? 1f : -1f;
+        var sideSign = leader.Id < yielder.Id ? 1f : -1f;
         var lateral = new Vector2(-leaderDirection.Y, leaderDirection.X) * sideSign;
         var yieldStep = Mathf.Clamp(
             overlap * 0.32f + GameConstants.LocalAvoidanceStep * 0.12f,
             GameConstants.DeadlockYieldMinStep * 0.8f,
             GameConstants.DeadlockYieldMaxStep * 0.75f);
+        yieldStep *= 1.22f;
         var offsets = new[]
         {
             lateral * yieldStep,

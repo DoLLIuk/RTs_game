@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Godot;
 using RtsNaGodote.Core.Data;
@@ -11,15 +12,24 @@ namespace RtsNaGodote.Core.Simulation.Pathfinding;
 public sealed class LocalMovementService
 {
     private const float SharedInteractionCompressionFactor = 0.48f;
+    private const float CohortCompressionFactor = 0.52f;
+    private const float CohortEmergencyCompressionFactor = 0.34f;
+    private const float AllyPassThroughFloorFactor = 0.22f;
+    private const float HeadOnAvoidanceDotThreshold = -0.4f;
+    private const float HeadOnAvoidanceSideFactor = 1.35f;
+    private const float HeadOnAvoidanceForwardFactor = 0.18f;
     private const float DirectApproachSideStepFactor = 0.24f;
     private const float DirectApproachMinSideStep = 1.25f;
     private const float DirectApproachMaxSideStepFactor = 0.45f;
+    private const float LaneChangeForwardFactor = 0.36f;
+    private const float LaneChangeSideFactor = 0.9f;
     private readonly WorldTileMap _map;
     private readonly List<SimUnit> _units;
     private readonly List<SimBuilding> _buildings;
     private readonly List<SimResourceNode> _resources;
     private readonly UnitSpatialHash _unitSpatialHash;
     private readonly List<SimUnit> _nearbyUnits = [];
+    private readonly List<SimUnit> _passThroughUnits = [];
     private readonly float _maxUnitRadius;
     private const float CompactSideStepFactor = 0.3f;
     private const float CompactForwardBiasFactor = 0.16f;
@@ -87,6 +97,7 @@ public sealed class LocalMovementService
 
         var queryRadius = unit.Radius + padding + _maxUnitRadius;
         _unitSpatialHash.Query(candidate, queryRadius, _nearbyUnits);
+        _passThroughUnits.Clear();
         foreach (var other in _nearbyUnits)
         {
             if (!other.Alive || other == unit || other == ignoredUnit)
@@ -94,21 +105,30 @@ public sealed class LocalMovementService
                 continue;
             }
 
-            if (AllowsCohortPassThrough(unit, other))
+            if (AllowsTemporaryAllyPassThrough(unit, other, candidate))
             {
+                _passThroughUnits.Add(other);
                 continue;
             }
 
             var minimum = unit.Radius + other.Radius + padding;
-            if (AllowsSharedInteractionCompression(unit, other, candidate))
-            {
-                minimum *= SharedInteractionCompressionFactor;
-            }
+            minimum *= GetDynamicClearanceScale(unit, other, candidate);
 
             if (candidate.DistanceTo(other.Position) < minimum)
             {
                 return false;
             }
+        }
+
+        if (_passThroughUnits.Count > 0)
+        {
+            ActivateAllyPassThrough(unit);
+            foreach (var other in _passThroughUnits)
+            {
+                ActivateAllyPassThrough(other);
+            }
+
+            unit.LastRecoveryKind = MovementRecoveryKind.AllyPassThrough;
         }
 
         return true;
@@ -128,35 +148,34 @@ public sealed class LocalMovementService
         }
 
         direction = direction.Normalized();
-        var blocker = FindMovementBlocker(unit, unit.Position + direction * GameConstants.LocalAvoidanceStep, 1.5f);
+        var step = GameConstants.LocalAvoidanceStep;
+        var directCandidate = unit.Position + direction * step;
+        var blockedByStatic = !IsCandidateStaticallyWalkable(directCandidate, unit.Radius + 1.5f);
+        var blocker = FindMovementBlocker(unit, directCandidate, 1.5f);
         if (ShouldPreferCohortFollow(unit, blocker, direction, out var blockerDirection))
         {
-            if (TryFollowCohortLeader(unit, blocker!, blockerDirection, GameConstants.LocalAvoidanceStep))
+            if (TryLaneChangeAroundBlocker(unit, blocker!, direction, step))
             {
                 return true;
             }
 
-            if (IsMovingForward(blocker!))
+            if (TryFollowCohortLeader(unit, blocker!, blockerDirection, GameConstants.LocalAvoidanceStep))
             {
-                return false;
+                unit.LastRecoveryKind = MovementRecoveryKind.CohortFollow;
+                return true;
             }
         }
 
-        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
-        var perpendicular = new Vector2(-direction.Y, direction.X) * preferredSide;
-        var sideStep = GameConstants.LocalAvoidanceStep * 0.7f;
-        var offsets = new[]
+        if (TryHeadOnAvoidance(unit, blocker, direction, step))
         {
-            perpendicular * sideStep,
-            -perpendicular * sideStep
-        };
+            unit.LastRecoveryKind = MovementRecoveryKind.HeadOnAvoidance;
+            return true;
+        }
 
-        foreach (var offset in offsets)
+        if (TryAdvanceWithCandidateFan(unit, direction, step, 2f, blocker, blockedByStatic, out var recoveryKind))
         {
-            if (TryMoveIntoFreeSpace(unit, offset))
-            {
-                return true;
-            }
+            unit.LastRecoveryKind = recoveryKind;
+            return true;
         }
 
         return false;
@@ -192,29 +211,18 @@ public sealed class LocalMovementService
             return true;
         }
 
-        var perpendicular = new Vector2(-direction.Y, direction.X);
-        var sideStep = Mathf.Clamp(
-            step * DirectApproachSideStepFactor,
-            DirectApproachMinSideStep,
-            GameConstants.LocalAvoidanceStep * DirectApproachMaxSideStepFactor);
-        var forwardStep = direction * Mathf.Min(step * 0.82f, distance);
-        var offsets = new[]
+        var probeStep = Mathf.Min(step, distance);
+        var blocker = FindMovementBlocker(unit, unit.Position + direction * probeStep, padding);
+        var blockedByStatic = !IsCandidateStaticallyWalkable(direct, unit.Radius + padding);
+        if (TryHeadOnAvoidance(unit, blocker, direction, probeStep))
         {
-            forwardStep + perpendicular * sideStep,
-            forwardStep - perpendicular * sideStep,
-            direction * Mathf.Min(step * 0.55f, distance) + perpendicular * (sideStep * 0.65f),
-            direction * Mathf.Min(step * 0.55f, distance) - perpendicular * (sideStep * 0.65f)
-        };
+            unit.LastRecoveryKind = MovementRecoveryKind.HeadOnAvoidance;
+            return true;
+        }
 
-        foreach (var offset in offsets)
+        if (TryAdvanceWithCandidateFan(unit, direction, probeStep, padding, blocker, blockedByStatic, out var recoveryKind))
         {
-            var candidate = unit.Position + offset;
-            if (!TryMoveToCandidate(unit, candidate, padding))
-            {
-                continue;
-            }
-
-            CommitMove(unit, candidate);
+            unit.LastRecoveryKind = recoveryKind;
             return true;
         }
 
@@ -228,45 +236,42 @@ public sealed class LocalMovementService
             return false;
         }
 
-        var blocker = FindMovementBlocker(unit, unit.Position + direction * step, 1.5f);
-        if (blocker is null)
+        var directCandidate = unit.Position + direction * step;
+        var blockedByStatic = !IsCandidateStaticallyWalkable(directCandidate, unit.Radius + 1.5f);
+        var blocker = FindMovementBlocker(unit, directCandidate, 1.5f);
+        if (blocker is null && !blockedByStatic)
         {
             return false;
         }
 
         if (ShouldPreferCohortFollow(unit, blocker, direction, out var blockerDirection))
         {
-            if (TryFollowCohortLeader(unit, blocker, blockerDirection, step))
+            if (TryLaneChangeAroundBlocker(unit, blocker!, direction, step))
             {
                 return true;
             }
 
-            if (IsMovingForward(blocker))
+            if (TryFollowCohortLeader(unit, blocker!, blockerDirection, step))
             {
-                return false;
+                unit.LastRecoveryKind = MovementRecoveryKind.CohortFollow;
+                return true;
             }
         }
 
-        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
-        var perpendicular = new Vector2(-direction.Y, direction.X);
-        var sideStep = Mathf.Clamp(step * CompactSideStepFactor, 1.2f, GameConstants.LocalAvoidanceStep * 0.55f);
-        var forwardBias = direction * Mathf.Min(step * CompactForwardBiasFactor, sideStep * 0.6f);
-        var offsets = new[]
+        if (TryHeadOnAvoidance(unit, blocker, direction, step))
         {
-            forwardBias + perpendicular * preferredSide * sideStep,
-            forwardBias - perpendicular * preferredSide * sideStep,
-            direction * Mathf.Min(step * 0.45f, sideStep * 0.5f) + perpendicular * preferredSide * (sideStep * 0.55f)
-        };
+            unit.LastRecoveryKind = MovementRecoveryKind.HeadOnAvoidance;
+            return true;
+        }
 
-        foreach (var offset in offsets)
+        if (blocker is not null && IsMovingForward(blocker) && !blockedByStatic)
         {
-            var candidate = unit.Position + offset;
-            if (!TryMoveToCandidate(unit, candidate, 1.5f))
-            {
-                continue;
-            }
+            return false;
+        }
 
-            CommitMove(unit, candidate);
+        if (TryAdvanceWithCandidateFan(unit, direction, step, 1.5f, blocker, blockedByStatic, out var recoveryKind))
+        {
+            unit.LastRecoveryKind = recoveryKind;
             return true;
         }
 
@@ -279,14 +284,14 @@ public sealed class LocalMovementService
         var distance = delta.Length();
         if (distance <= 0.01f)
         {
-            return IsCandidateWalkable(end, clearance);
+            return IsCandidateStaticallyWalkable(end, clearance);
         }
 
         var steps = Mathf.Max(2, Mathf.CeilToInt(distance / 10f));
         for (var index = 1; index <= steps; index++)
         {
             var sample = start + delta * (index / (float)steps);
-            if (!IsCandidateWalkable(sample, clearance))
+            if (!IsCandidateStaticallyWalkable(sample, clearance))
             {
                 return false;
             }
@@ -308,16 +313,13 @@ public sealed class LocalMovementService
                 continue;
             }
 
-            if (AllowsCohortPassThrough(unit, other))
+            if (AllowsTemporaryAllyPassThrough(unit, other, candidate))
             {
                 continue;
             }
 
             var minimum = unit.Radius + other.Radius + padding;
-            if (AllowsSharedInteractionCompression(unit, other, candidate))
-            {
-                minimum *= SharedInteractionCompressionFactor;
-            }
+            minimum *= GetDynamicClearanceScale(unit, other, candidate);
 
             var distance = candidate.DistanceTo(other.Position);
             if (distance >= minimum || distance >= bestDistance)
@@ -351,6 +353,72 @@ public sealed class LocalMovementService
         return true;
     }
 
+    private bool TryHeadOnAvoidance(SimUnit unit, SimUnit? blocker, Vector2 direction, float step)
+    {
+        if (blocker is null || !IsHeadOnConflict(unit, blocker, direction, out var blockerDirection))
+        {
+            return false;
+        }
+
+        var preferredSide = GetHeadOnAvoidanceSide(unit, blocker);
+        var perpendicular = new Vector2(-direction.Y, direction.X);
+        var convoyFactor = 1f + Mathf.Min(0.75f, CountAlignedFollowers(unit, -direction) * 0.22f);
+        var sideStep = Mathf.Max(
+            (unit.Radius + blocker.Radius + 3f) * HeadOnAvoidanceSideFactor * convoyFactor,
+            step * 1.15f);
+        var forwardBias = direction * Mathf.Min(step * HeadOnAvoidanceForwardFactor, sideStep * 0.22f);
+        var blockerForwardBias = blockerDirection * Mathf.Min(step * 0.08f, sideStep * 0.12f);
+        var offsets = new[]
+        {
+            forwardBias + perpendicular * preferredSide * sideStep,
+            forwardBias - perpendicular * preferredSide * sideStep,
+            blockerForwardBias + perpendicular * preferredSide * (sideStep * 0.82f),
+            blockerForwardBias - perpendicular * preferredSide * (sideStep * 0.82f)
+        };
+
+        foreach (var offset in offsets)
+        {
+            var candidate = unit.Position + offset;
+            if (!TryMoveToCandidate(unit, candidate, 1.5f))
+            {
+                continue;
+            }
+
+            CommitMove(unit, candidate);
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryLaneChangeAroundBlocker(SimUnit unit, SimUnit blocker, Vector2 direction, float step)
+    {
+        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
+        var perpendicular = new Vector2(-direction.Y, direction.X);
+        var sideStep = Mathf.Clamp(step * LaneChangeSideFactor, 2f, GameConstants.LocalAvoidanceStep * 1.15f);
+        var forwardStep = direction * Mathf.Min(step * LaneChangeForwardFactor, sideStep * 0.75f);
+        var offsets = new[]
+        {
+            forwardStep + perpendicular * preferredSide * sideStep,
+            forwardStep - perpendicular * preferredSide * sideStep
+        };
+
+        foreach (var offset in offsets)
+        {
+            var candidate = unit.Position + offset;
+            if (!TryMoveToCandidate(unit, candidate, 1.5f))
+            {
+                continue;
+            }
+
+            CommitMove(unit, candidate);
+            unit.LastRecoveryKind = MovementRecoveryKind.CohortLaneChange;
+            return true;
+        }
+
+        return false;
+    }
+
     private static bool ShouldPreferCohortFollow(SimUnit unit, SimUnit? blocker, Vector2 direction, out Vector2 blockerDirection)
     {
         blockerDirection = Vector2.Zero;
@@ -370,9 +438,59 @@ public sealed class LocalMovementService
         return sameDirection >= 0.65f && blockerAhead;
     }
 
-    private static bool AllowsCohortPassThrough(SimUnit unit, SimUnit other)
+    private static bool IsHeadOnConflict(SimUnit unit, SimUnit blocker, Vector2 direction, out Vector2 blockerDirection)
     {
-        return SharesActiveMarchCohort(unit, other);
+        blockerDirection = GetTravelDirection(blocker);
+        if (blockerDirection == Vector2.Zero)
+        {
+            return false;
+        }
+
+        var blockerAhead = direction.Dot(blocker.Position - unit.Position) > unit.Radius * 0.2f;
+        if (!blockerAhead)
+        {
+            return false;
+        }
+
+        return direction.Dot(blockerDirection) <= HeadOnAvoidanceDotThreshold;
+    }
+
+    private int CountAlignedFollowers(SimUnit unit, Vector2 backwardDirection)
+    {
+        var count = 0;
+        var radius = unit.Radius + GameConstants.GroupSpacing * 1.8f;
+        _unitSpatialHash.Query(unit.Position, radius, _nearbyUnits);
+        foreach (var other in _nearbyUnits)
+        {
+            if (!other.Alive || other == unit || other.Side != unit.Side)
+            {
+                continue;
+            }
+
+            var offset = other.Position - unit.Position;
+            if (offset.LengthSquared() <= 1f)
+            {
+                continue;
+            }
+
+            var otherDirection = GetTravelDirection(other);
+            if (otherDirection == Vector2.Zero || backwardDirection.Dot(offset.Normalized()) < 0.45f)
+            {
+                continue;
+            }
+
+            if (otherDirection.Dot(-backwardDirection) >= 0.55f)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static float GetHeadOnAvoidanceSide(SimUnit unit, SimUnit blocker)
+    {
+        return unit.Id < blocker.Id ? 1f : -1f;
     }
 
     private static bool AllowsSharedInteractionCompression(SimUnit unit, SimUnit other, Vector2 candidate)
@@ -410,6 +528,17 @@ public sealed class LocalMovementService
     }
 
     private bool IsCandidateWalkable(Vector2 candidate, float clearance)
+    {
+        var tile = _map.WorldToTile(candidate);
+        if (!_map.IsWalkable(tile.X, tile.Y))
+        {
+            return false;
+        }
+
+        return IsCandidateStaticallyWalkable(candidate, clearance);
+    }
+
+    private bool IsCandidateStaticallyWalkable(Vector2 candidate, float clearance)
     {
         var tile = _map.WorldToTile(candidate);
         if (!_map.IsWalkable(tile.X, tile.Y))
@@ -531,6 +660,133 @@ public sealed class LocalMovementService
         }
 
         return Vector2.Zero;
+    }
+
+    private float GetDynamicClearanceScale(SimUnit unit, SimUnit other, Vector2 candidate)
+    {
+        var scale = 1f;
+        if (SharesActiveMarchCohort(unit, other))
+        {
+            var stalled = unit.StuckAccumMs >= 120d ||
+                          other.StuckAccumMs >= 120d ||
+                          unit.PathProgressStallMs >= 120d ||
+                          other.PathProgressStallMs >= 120d;
+            scale = stalled ? CohortEmergencyCompressionFactor : CohortCompressionFactor;
+        }
+
+        if (AllowsSharedInteractionCompression(unit, other, candidate))
+        {
+            scale = Math.Min(scale, SharedInteractionCompressionFactor);
+        }
+
+        return scale;
+    }
+
+    private static bool AllowsTemporaryAllyPassThrough(SimUnit unit, SimUnit other, Vector2 candidate)
+    {
+        if (!CanUseAllyPassThrough(unit, other))
+        {
+            return false;
+        }
+
+        var minimum = (unit.Radius + other.Radius) * AllyPassThroughFloorFactor;
+        return candidate.DistanceTo(other.Position) >= minimum;
+    }
+
+    private static bool CanUseAllyPassThrough(SimUnit unit, SimUnit other)
+    {
+        if (unit.Side != other.Side ||
+            !unit.Alive ||
+            !other.Alive)
+        {
+            return false;
+        }
+
+        return unit.StuckAccumMs >= GameConstants.AllyPassThroughDelayMs ||
+               unit.PathProgressStallMs >= GameConstants.AllyPassThroughDelayMs ||
+               other.StuckAccumMs >= GameConstants.AllyPassThroughDelayMs ||
+               other.PathProgressStallMs >= GameConstants.AllyPassThroughDelayMs;
+    }
+
+    private static void ActivateAllyPassThrough(SimUnit unit)
+    {
+        unit.IsUsingAllyPassThrough = true;
+        unit.AllyPassThroughTimerMs = Mathf.Max((float)unit.AllyPassThroughTimerMs, GameConstants.AllyPassThroughHoldMs);
+    }
+
+    private bool TryAdvanceWithCandidateFan(
+        SimUnit unit,
+        Vector2 direction,
+        float step,
+        float padding,
+        SimUnit? blocker,
+        bool blockedByStatic,
+        out MovementRecoveryKind recoveryKind)
+    {
+        recoveryKind = MovementRecoveryKind.None;
+        var preferredSide = GetPreferredSteerSide(unit, direction, blocker);
+        var waypoint = unit.Path.Count > 0 ? unit.Path[0] : unit.Position + direction * step;
+        var bestScore = float.PositiveInfinity;
+        var bestCandidate = Vector2.Zero;
+        var bestRecovery = blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance;
+        var found = false;
+
+        TryFanCandidate(0f, 0.55f, blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance);
+        TryFanCandidate(0.18f * preferredSide, 0.92f, blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance);
+        TryFanCandidate(-0.18f * preferredSide, 0.92f, blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance);
+        TryFanCandidate(0.42f * preferredSide, 0.86f, blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance);
+        TryFanCandidate(-0.42f * preferredSide, 0.86f, blockedByStatic ? MovementRecoveryKind.StaticSlide : MovementRecoveryKind.LocalAvoidance);
+        TryFanCandidate(0.72f * preferredSide, 0.78f, MovementRecoveryKind.StaticSlide);
+        TryFanCandidate(-0.72f * preferredSide, 0.78f, MovementRecoveryKind.StaticSlide);
+
+        if (blockedByStatic)
+        {
+            var perpendicular = new Vector2(-direction.Y, direction.X);
+            TryOffsetCandidate(direction * (step * 0.18f) + perpendicular * preferredSide * Mathf.Max(1.5f, step * 0.8f), MovementRecoveryKind.StaticSlide);
+            TryOffsetCandidate(direction * (step * 0.18f) - perpendicular * preferredSide * Mathf.Max(1.5f, step * 0.8f), MovementRecoveryKind.StaticSlide);
+        }
+
+        if (!found)
+        {
+            return false;
+        }
+
+        CommitMove(unit, bestCandidate);
+        recoveryKind = bestRecovery;
+        return true;
+
+        void TryFanCandidate(float angle, float distanceScale, MovementRecoveryKind candidateRecovery)
+        {
+            var candidateDirection = direction.Rotated(angle);
+            var candidate = unit.Position + candidateDirection * (step * distanceScale);
+            TryCandidate(candidate, candidateRecovery, Mathf.Abs(angle) * 0.65f);
+        }
+
+        void TryOffsetCandidate(Vector2 offset, MovementRecoveryKind candidateRecovery)
+        {
+            TryCandidate(unit.Position + offset, candidateRecovery, 0.55f);
+        }
+
+        void TryCandidate(Vector2 candidate, MovementRecoveryKind candidateRecovery, float turnPenalty)
+        {
+            if (!TryMoveToCandidate(unit, candidate, padding))
+            {
+                return;
+            }
+
+            var forwardProgress = unit.Position.DistanceTo(waypoint) - candidate.DistanceTo(waypoint);
+            var blockerPenalty = blocker is null ? 0f : Mathf.Max(0f, blocker.Position.DistanceTo(candidate) - (unit.Radius + blocker.Radius));
+            var score = candidate.DistanceTo(waypoint) - forwardProgress * 0.35f + turnPenalty + blockerPenalty * 0.01f;
+            if (score >= bestScore)
+            {
+                return;
+            }
+
+            bestScore = score;
+            bestCandidate = candidate;
+            bestRecovery = candidateRecovery;
+            found = true;
+        }
     }
 
     private static bool OverlapsFootprint(
