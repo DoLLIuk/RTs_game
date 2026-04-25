@@ -83,6 +83,7 @@ public sealed partial class GameSimulation
 		Economy = new EconomySystem();
 		_aiStateEnteredMs = 0d;
 		_aiKnowledge = new AiKnowledgeService(CreateAiKnowledgeContext());
+		_aiArmyManager = new AiArmyManager(CreateAiArmyManagerContext());
 		_scoutSystem = new ScoutSystem(CreateScoutContext());
 
 		SpawnInitialState();
@@ -2429,22 +2430,19 @@ public sealed partial class GameSimulation
 		var hasWorkshop = buildings.Exists(building => building.Kind == BuildingKind.Workshop && building.Completed);
 		var barracks = buildings.Find(building => building.Kind == BuildingKind.Barracks && building.Completed);
 		var workshop = buildings.Find(building => building.Kind == BuildingKind.Workshop && building.Completed);
-		var armyMetrics = CalculateSquadMetrics(army);
+		var armyMetrics = _aiArmyManager.CalculateMetrics(army);
 		var knownEnemyPower = _aiKnowledge.EstimateKnownEnemyPower();
 		var pressure = _aiKnowledge.KnownEnemyPressureNear(hall.Center, GameConstants.TileSize * _difficultyDefinition.DefendRadiusTiles);
 		var confirmedBase = _aiKnowledge.LastKnownPlayerBase;
 		var suspectedBase = confirmedBase ?? Map.TileToWorldCenter(Layout.PlayerBase.X, Layout.PlayerBase.Y);
 		var stagePoint = GetAiStagePoint(hall.Center, suspectedBase);
-		var allowHarassSplit = ShouldUseHarassSplit(hasBarracks, confirmedBase.HasValue, pressure, armyMetrics, knownEnemyPower);
-		BuildAiSquads(army, allowHarassSplit, out var provisionalMainArmy, out var provisionalHarassSquad);
-		var mainMetrics = CalculateSquadMetrics(provisionalMainArmy);
-		var harassMetrics = CalculateSquadMetrics(provisionalHarassSquad);
-		var nextState = DetermineAiState(
-			hall,
+		var allowHarassSplit = _aiArmyManager.ShouldUseHarassSplit(hasBarracks, confirmedBase.HasValue, pressure, armyMetrics, knownEnemyPower);
+		var provisionalPlan = _aiArmyManager.BuildPlan(army, allowHarassSplit);
+		var nextState = _aiArmyManager.DetermineState(
 			hasBarracks,
 			armyMetrics,
-			mainMetrics,
-			harassMetrics,
+			provisionalPlan.MainMetrics,
+			provisionalPlan.HarassMetrics,
 			confirmedBase.HasValue,
 			pressure,
 			knownEnemyPower);
@@ -2469,9 +2467,11 @@ public sealed partial class GameSimulation
 			_scoutSystem.UpdateRecall(stagePoint);
 		}
 
-		BuildAiSquads(army, allowHarassSplit, out var mainArmy, out var harassSquad);
-		mainMetrics = CalculateSquadMetrics(mainArmy);
-		harassMetrics = CalculateSquadMetrics(harassSquad);
+		var finalPlan = _aiArmyManager.BuildPlan(army, allowHarassSplit);
+		var mainArmy = finalPlan.MainArmy;
+		var harassSquad = finalPlan.HarassSquad;
+		var mainMetrics = finalPlan.MainMetrics;
+		var harassMetrics = finalPlan.HarassMetrics;
 
 		if (_aiState == AiState.Harass)
 		{
@@ -2592,159 +2592,6 @@ public sealed partial class GameSimulation
 	private bool NearbyTower(List<SimBuilding> buildings, SimBuilding hall)
 	{
 		return buildings.Exists(building => building.Kind == BuildingKind.Tower && building.Center.DistanceTo(hall.Center) < GameConstants.TileSize * 10f);
-	}
-
-	private AiState DetermineAiState(
-		SimBuilding hall,
-		bool hasBarracks,
-		AiSquadMetrics armyMetrics,
-		AiSquadMetrics mainMetrics,
-		AiSquadMetrics harassMetrics,
-		bool baseConfirmed,
-		bool pressure,
-		float knownEnemyPower)
-	{
-		if (pressure)
-		{
-			return AiState.Defend;
-		}
-
-		if (_aiState == AiState.Harass && (ShouldFinish(armyMetrics, knownEnemyPower) || ShouldPush(armyMetrics, knownEnemyPower)))
-		{
-			return AiState.Regroup;
-		}
-
-		if (_aiState == AiState.Scout && ShouldContinueScoutMission(baseConfirmed))
-		{
-			return AiState.Scout;
-		}
-
-		if (ShouldFinish(armyMetrics, knownEnemyPower))
-		{
-			return AiState.Finish;
-		}
-
-		if (!baseConfirmed && _elapsedMs >= _difficultyDefinition.ScoutDelayMs)
-		{
-			return AiState.Scout;
-		}
-
-		if (!hasBarracks || _elapsedMs < _difficultyDefinition.ScoutDelayMs)
-		{
-			return AiState.Open;
-		}
-
-		if (_aiState == AiState.Push || _aiState == AiState.Finish)
-		{
-			return ShouldRetreat(armyMetrics, knownEnemyPower) ? AiState.Regroup : _aiState;
-		}
-
-		if (_aiState == AiState.Harass && harassMetrics.Count > 0 && _elapsedMs - _aiStateEnteredMs < 5200d)
-		{
-			return AiState.Harass;
-		}
-
-		if (_aiState == AiState.Regroup && _elapsedMs - _aiStateEnteredMs < _difficultyDefinition.RegroupDurationMs)
-		{
-			return AiState.Regroup;
-		}
-
-		if (Init.AiProfile == AiProfile.Harass && CanLaunchHarass(mainMetrics, harassMetrics))
-		{
-			return AiState.Harass;
-		}
-
-		if (ShouldPush(armyMetrics, knownEnemyPower))
-		{
-			return AiState.Push;
-		}
-
-		return armyMetrics.Count >= 3 ? AiState.Regroup : AiState.Boom;
-	}
-
-	private bool ShouldUseHarassSplit(
-		bool hasBarracks,
-		bool baseConfirmed,
-		bool pressure,
-		AiSquadMetrics armyMetrics,
-		float knownEnemyPower)
-	{
-		if (Init.AiProfile != AiProfile.Harass || pressure || !hasBarracks || !baseConfirmed)
-		{
-			return false;
-		}
-
-		if (_aiState is AiState.Push or AiState.Finish or AiState.Regroup)
-		{
-			return false;
-		}
-
-		return !ShouldFinish(armyMetrics, knownEnemyPower) && !ShouldPush(armyMetrics, knownEnemyPower);
-	}
-
-	private bool ShouldPush(AiSquadMetrics mainMetrics, float knownEnemyPower)
-	{
-		if (mainMetrics.Count == 0 || mainMetrics.FrontlineCount == 0 || mainMetrics.Power < _difficultyDefinition.PushMinPower)
-		{
-			return false;
-		}
-
-		if (knownEnemyPower <= 0.25f)
-		{
-			return true;
-		}
-
-		return mainMetrics.Power >= knownEnemyPower * _difficultyDefinition.AttackAdvantageRatio;
-	}
-
-	private bool ShouldRetreat(AiSquadMetrics mainMetrics, float knownEnemyPower)
-	{
-		if (mainMetrics.Count == 0)
-		{
-			return false;
-		}
-
-		if (mainMetrics.BacklineCount > 0 && mainMetrics.FrontlineCount == 0)
-		{
-			return true;
-		}
-
-		return knownEnemyPower > 0.25f && mainMetrics.Power <= knownEnemyPower * _difficultyDefinition.RetreatRatio;
-	}
-
-	private bool ShouldFinish(AiSquadMetrics mainMetrics, float knownEnemyPower)
-	{
-		var hasKnownTownHall = false;
-		foreach (var building in _aiKnowledge.KnownBuildings)
-		{
-			if (building.Kind == BuildingKind.TownHall && IsFreshEnemyMemory(building.LastSeenMs))
-			{
-				hasKnownTownHall = true;
-				break;
-			}
-		}
-
-		if (!hasKnownTownHall && _aiKnowledge.LastKnownPlayerBase.HasValue && _aiKnowledge.KnownBuildingCount <= 2 && mainMetrics.Power >= knownEnemyPower + 4f)
-		{
-			return true;
-		}
-
-		return mainMetrics.Power >= Mathf.Max(_difficultyDefinition.PushMinPower + 2f, knownEnemyPower * 1.75f) && _aiKnowledge.LastKnownPlayerBase.HasValue;
-	}
-
-	private bool CanLaunchHarass(AiSquadMetrics mainMetrics, AiSquadMetrics harassMetrics)
-	{
-		if (Init.AiProfile != AiProfile.Harass || harassMetrics.Count == 0 || !_aiKnowledge.LastKnownPlayerBase.HasValue)
-		{
-			return false;
-		}
-
-		if (_elapsedMs - _aiLastHarassCommandMs < 6500d)
-		{
-			return false;
-		}
-
-		return harassMetrics.Power >= _difficultyDefinition.HarassMinPower && mainMetrics.Count >= 3;
 	}
 
 	private void MaintainAiEconomy(
@@ -2971,7 +2818,7 @@ public sealed partial class GameSimulation
 		var facing = lookTarget - anchor;
 		if (facing.LengthSquared() <= 0.01f)
 		{
-			facing = lookTarget - CalculateSquadMetrics(squad).Center;
+			facing = lookTarget - _aiArmyManager.CalculateMetrics(squad).Center;
 		}
 
 		if (facing.LengthSquared() <= 0.01f)
@@ -3061,157 +2908,6 @@ public sealed partial class GameSimulation
 		}
 
 		IssueAttackMove(unit, destination);
-	}
-
-	private void BuildAiSquads(List<SimUnit> army, bool allowHarassSplit, out List<SimUnit> mainArmy, out List<SimUnit> harassSquad)
-	{
-		mainArmy = new List<SimUnit>();
-		harassSquad = new List<SimUnit>();
-		var eligibleArmy = army.FindAll(unit => !_scoutSystem.IsScoutReserved(unit.Id));
-
-		if (!allowHarassSplit || eligibleArmy.Count < 5 || !_aiKnowledge.LastKnownPlayerBase.HasValue)
-		{
-			mainArmy.AddRange(eligibleArmy);
-			return;
-		}
-
-		var totalPower = 0f;
-		var totalFrontline = 0;
-		foreach (var unit in eligibleArmy)
-		{
-			totalPower += CalculateUnitPower(unit);
-			if (!unit.IsRanged() && unit.Kind != UnitKind.Catapult)
-			{
-				totalFrontline++;
-			}
-		}
-
-		var desiredSize = GetDesiredHarassSquadSize(eligibleArmy.Count);
-		var pickedPower = 0f;
-		var pickedFrontline = 0;
-		var candidates = BuildHarassCandidates(eligibleArmy);
-		foreach (var candidate in candidates)
-		{
-			if (harassSquad.Count >= desiredSize)
-			{
-				break;
-			}
-
-			var candidatePower = CalculateUnitPower(candidate);
-			var isFrontline = !candidate.IsRanged() && candidate.Kind != UnitKind.Catapult;
-			var remainingFrontline = totalFrontline - pickedFrontline - (isFrontline ? 1 : 0);
-			var remainingPower = totalPower - pickedPower - candidatePower;
-			if (remainingFrontline < 2 || remainingPower < totalPower * 0.65f)
-			{
-				continue;
-			}
-
-			harassSquad.Add(candidate);
-			pickedPower += candidatePower;
-			if (isFrontline)
-			{
-				pickedFrontline++;
-			}
-		}
-
-		foreach (var unit in eligibleArmy)
-		{
-			if (!harassSquad.Contains(unit))
-			{
-				mainArmy.Add(unit);
-			}
-		}
-
-		if (harassSquad.Count == 0)
-		{
-			mainArmy.Clear();
-			mainArmy.AddRange(eligibleArmy);
-		}
-	}
-
-	private static float CalculateUnitPower(SimUnit unit)
-	{
-		return unit.Score * (unit.Hp / (float)unit.MaxHp);
-	}
-
-	private static int GetDesiredHarassSquadSize(int armyCount)
-	{
-		return armyCount switch
-		{
-			< 5 => 0,
-			<= 7 => 2,
-			<= 10 => 3,
-			<= 14 => 4,
-			_ => 5
-		};
-	}
-
-	private static List<SimUnit> BuildHarassCandidates(List<SimUnit> army)
-	{
-		var knights = new List<SimUnit>();
-		var archers = new List<SimUnit>();
-		var footmen = new List<SimUnit>();
-		foreach (var unit in army)
-		{
-			if (unit.Kind == UnitKind.Catapult)
-			{
-				continue;
-			}
-
-			switch (unit.Kind)
-			{
-				case UnitKind.Knight:
-					knights.Add(unit);
-					break;
-				case UnitKind.Archer:
-					archers.Add(unit);
-					break;
-				case UnitKind.Footman:
-					footmen.Add(unit);
-					break;
-			}
-		}
-
-		var result = new List<SimUnit>(knights.Count + archers.Count + footmen.Count);
-		result.AddRange(knights);
-		result.AddRange(archers);
-		result.AddRange(footmen);
-		return result;
-	}
-
-	private AiSquadMetrics CalculateSquadMetrics(List<SimUnit> squad)
-	{
-		if (squad.Count == 0)
-		{
-			return new AiSquadMetrics(Vector2.Zero, 0f, 0f, 0, 0, 0, 0);
-		}
-
-		var center = Vector2.Zero;
-		var power = 0f;
-		var slowest = float.PositiveInfinity;
-		var frontline = 0;
-		var backline = 0;
-		var siege = 0;
-		foreach (var unit in squad)
-		{
-			center += unit.Position;
-			power += unit.Score * (unit.Hp / (float)unit.MaxHp);
-			slowest = float.Min(slowest, unit.Speed);
-			if (unit.Kind == UnitKind.Catapult)
-			{
-				siege++;
-			}
-			else if (unit.IsRanged())
-			{
-				backline++;
-			}
-			else
-			{
-				frontline++;
-			}
-		}
-
-		return new AiSquadMetrics(center / squad.Count, power, slowest, frontline, backline, siege, squad.Count);
 	}
 
 	private float EstimateKnownEnemyPower()
@@ -3706,7 +3402,7 @@ public sealed partial class GameSimulation
 
 	private HarassObjective SelectHarassObjective(List<SimUnit> squad, SimBuilding hall, Vector2 suspectedBase)
 	{
-		var squadCenter = CalculateSquadMetrics(squad).Center;
+		var squadCenter = _aiArmyManager.CalculateMetrics(squad).Center;
 		if (squadCenter == Vector2.Zero)
 		{
 			squadCenter = squad[0].Position;
@@ -3915,7 +3611,7 @@ public sealed partial class GameSimulation
 
 			if (unit.Position.DistanceTo(position) <= radius)
 			{
-				power += CalculateUnitPower(unit);
+				power += unit.Score * (unit.Hp / (float)unit.MaxHp);
 			}
 		}
 
@@ -4460,18 +4156,6 @@ public sealed partial class GameSimulation
 		return bestBuilding;
 	}
 
-	private enum AiState
-	{
-		Open,
-		Scout,
-		Boom,
-		Defend,
-		Regroup,
-		Push,
-		Harass,
-		Finish
-	}
-
 	private enum HarassMissionPhase
 	{
 		Approach,
@@ -4536,5 +4220,4 @@ public sealed partial class GameSimulation
 	}
 
 	private readonly record struct HarassObjective(HarassTargetKind Kind, Vector2 Position, int? EntityId, float Score);
-	private readonly record struct AiSquadMetrics(Vector2 Center, float Power, float SlowestSpeed, int FrontlineCount, int BacklineCount, int SiegeCount, int Count);
 }
