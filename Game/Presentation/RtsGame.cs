@@ -159,6 +159,7 @@ public partial class RtsGame : Node2D
         _simulationTickCount++;
         UpdateDebugOverlay(delta, true);
         UpdateFog();
+        PushPlayerVisionSnapshot();
         UpdateCamera(delta);
         SyncViews();
         SyncHud();

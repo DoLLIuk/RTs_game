@@ -11,6 +11,7 @@ namespace RtsNaGodote.Core.Simulation;
 
 internal delegate bool ScoutTryFindWalkableRaidPointDelegate(Vector2I centerTile, int minRadius, int maxRadius, Vector2 reference, out Vector2 point);
 internal delegate Dictionary<int, float> ScoutBuildDynamicTilePenaltyDelegate(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute);
+internal delegate void ScoutCommandMoveDelegate(SimUnit unit, Vector2 destination);
 
 internal sealed class ScoutContext
 {
@@ -25,6 +26,7 @@ internal sealed class ScoutContext
     private readonly Func<Vector2, float, float> _estimateKnownThreatAt;
     private readonly ScoutTryFindWalkableRaidPointDelegate _tryFindWalkableRaidPoint;
     private readonly ScoutBuildDynamicTilePenaltyDelegate _buildDynamicTilePenalty;
+    private readonly ScoutCommandMoveDelegate _commandMove;
 
     public ScoutContext(
         Difficulty difficulty,
@@ -42,7 +44,8 @@ internal sealed class ScoutContext
         Func<Vector2, float, bool> hasKnownOuterTargetNear,
         Func<Vector2, float, float> estimateKnownThreatAt,
         ScoutTryFindWalkableRaidPointDelegate tryFindWalkableRaidPoint,
-        ScoutBuildDynamicTilePenaltyDelegate buildDynamicTilePenalty)
+        ScoutBuildDynamicTilePenaltyDelegate buildDynamicTilePenalty,
+        ScoutCommandMoveDelegate commandMove)
     {
         Difficulty = difficulty;
         Map = map;
@@ -60,6 +63,7 @@ internal sealed class ScoutContext
         _estimateKnownThreatAt = estimateKnownThreatAt;
         _tryFindWalkableRaidPoint = tryFindWalkableRaidPoint;
         _buildDynamicTilePenalty = buildDynamicTilePenalty;
+        _commandMove = commandMove;
     }
 
     public Difficulty Difficulty { get; }
@@ -105,5 +109,10 @@ internal sealed class ScoutContext
     public Dictionary<int, float> BuildDynamicTilePenalty(SimUnit unit, Vector2I goal, int goalRadiusTiles, bool stuckReroute)
     {
         return _buildDynamicTilePenalty(unit, goal, goalRadiusTiles, stuckReroute);
+    }
+
+    public void CommandMove(SimUnit unit, Vector2 destination)
+    {
+        _commandMove(unit, destination);
     }
 }

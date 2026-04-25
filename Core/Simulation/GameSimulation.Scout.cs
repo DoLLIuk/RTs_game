@@ -18,15 +18,16 @@ public sealed partial class GameSimulation
             _difficultyDefinition,
             () => _elapsedMs,
             () => _playerVisionSnapshot,
-            () => _aiMemory.LastKnownPlayerBase,
-            () => _aiMemory.LastKnownPlayerBaseTile,
-            CountKnownWorkersNear,
-            CountKnownCombatUnitsNear,
-            HasKnownTowerNear,
-            HasKnownOuterTargetNear,
-            EstimateKnownThreatAt,
+            () => _aiKnowledge.LastKnownPlayerBase,
+            () => _aiKnowledge.LastKnownPlayerBaseTile,
+            (position, radius) => _aiKnowledge.CountScoutKnownWorkersNear(position, radius, ScoutIntelFreshMemoryMs),
+            (position, radius) => _aiKnowledge.CountScoutKnownCombatUnitsNear(position, radius, ScoutIntelFreshMemoryMs),
+            (position, radius) => _aiKnowledge.HasScoutKnownTowerNear(position, radius, ScoutIntelFreshMemoryMs),
+            (position, radius) => _aiKnowledge.HasScoutKnownOuterTargetNear(position, radius, ScoutIntelFreshMemoryMs),
+            (position, radius) => _aiKnowledge.EstimateScoutKnownThreatAt(position, radius, ScoutIntelFreshMemoryMs),
             TryFindWalkableRaidPoint,
-            BuildDynamicTilePenalty);
+            BuildDynamicTilePenalty,
+            CommandUnitMove);
     }
 
     private bool ShouldContinueScoutMission(bool baseConfirmed)
@@ -34,9 +35,9 @@ public sealed partial class GameSimulation
         return _scoutSystem.ShouldContinueMission(baseConfirmed);
     }
 
-    private void CommandScout(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 stagePoint)
+    private void CommandScout(List<SimUnit> army, List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 stagePoint)
     {
-        var scout = _scoutSystem.SelectScoutUnit(mainArmy, workersFallback, suspectedBase, stagePoint);
+        var scout = _scoutSystem.SelectScoutUnit(army, workersFallback, suspectedBase, stagePoint);
         if (scout is null)
         {
             _scoutSystem.ResetMission();

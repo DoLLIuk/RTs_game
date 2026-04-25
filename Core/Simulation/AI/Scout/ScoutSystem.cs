@@ -17,6 +17,7 @@ internal sealed class ScoutSystem
     private const float ScoutPeekCompletionDistance = GameConstants.TileSize * 0.38f;
     private const float ScoutEntryArrivalDistance = GameConstants.TileSize * 0.95f;
     private const float ScoutMinVisibleCommitMs = 260f;
+    private const float ScoutRecallAssemblyArrivalDistance = 24f;
     private const int ScoutMaxVisibleEntryTiles = 1;
     private const int ScoutMinPeekVisibleTiles = 2;
     private const int FrontierScoutPreferredPeekDepthTiles = 2;
@@ -26,11 +27,15 @@ internal sealed class ScoutSystem
     private readonly ScoutContext _context;
     private readonly ScoutMissionState _mission = new();
     private int? _workerScoutId;
+    private int? _recallingScoutId;
+    private Vector2 _assemblyPoint;
 
     public ScoutSystem(ScoutContext context)
     {
         _context = context;
     }
+
+    public bool HasRecallingScout => _recallingScoutId.HasValue;
 
     public void ClearWorkerScoutReservation()
     {
@@ -42,6 +47,66 @@ internal sealed class ScoutSystem
         ReleaseScoutLock();
         _mission.Reset();
         _workerScoutId = null;
+    }
+
+    public void BeginRecallToAssembly(Vector2 assemblyPoint)
+    {
+        _assemblyPoint = assemblyPoint;
+
+        if (_mission.ScoutUnitId is not int scoutId)
+        {
+            return;
+        }
+
+        if (_recallingScoutId == scoutId)
+        {
+            return;
+        }
+
+        var scout = _context.Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == scoutId);
+        if (scout is null)
+        {
+            ClearRecallState();
+            ClearMissionOwnership();
+            return;
+        }
+
+        _recallingScoutId = scoutId;
+        scout.IsNonCombatScout = true;
+        scout.TargetCombat = null;
+        ClearMissionOwnership();
+    }
+
+    public void UpdateRecall(Vector2 assemblyPoint)
+    {
+        _assemblyPoint = assemblyPoint;
+        if (_recallingScoutId is not int scoutId)
+        {
+            return;
+        }
+
+        var scout = _context.Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == scoutId);
+        if (scout is null)
+        {
+            ClearRecallState();
+            return;
+        }
+
+        scout.IsNonCombatScout = true;
+        scout.TargetCombat = null;
+        if (scout.Position.DistanceTo(_assemblyPoint) <= ScoutRecallAssemblyArrivalDistance)
+        {
+            scout.IsNonCombatScout = false;
+            ClearRecallState();
+            return;
+        }
+
+        _context.CommandMove(scout, _assemblyPoint);
+    }
+
+    public bool IsScoutReserved(int unitId)
+    {
+        return _mission.ScoutUnitId == unitId || _recallingScoutId == unitId;
     }
 
     public bool ShouldContinueMission(bool baseConfirmed)
@@ -93,6 +158,11 @@ internal sealed class ScoutSystem
 
     public SimUnit? SelectScoutUnit(List<SimUnit> mainArmy, bool workersFallback, Vector2 suspectedBase, Vector2 fallback)
     {
+        if (HasRecallingScout)
+        {
+            return null;
+        }
+
         SimUnit? scout = null;
         if (_mission.ScoutUnitId.HasValue)
         {
@@ -241,6 +311,12 @@ internal sealed class ScoutSystem
             return fallback;
         }
 
+        if (_mission.Phase == ScoutMissionPhase.ApproachEdge &&
+            TryStartBreakContactForImmediateThreat(scout, threat, fallback, "approach-threat", out var emergencyRetreat))
+        {
+            return emergencyRetreat;
+        }
+
         switch (_mission.Phase)
         {
             case ScoutMissionPhase.ApproachEdge:
@@ -301,10 +377,9 @@ internal sealed class ScoutSystem
                     return _mission.EntryPoint;
                 }
 
-                if (threat is not null && scout.Position.DistanceTo(threat.Position) <= GameConstants.TileSize * 3.4f)
+                if (TryStartBreakContactForImmediateThreat(scout, threat, fallback, "reposition-threat", out var retreatTarget))
                 {
-                    StartScoutBreakContact();
-                    return GetScoutBreakContactTarget(scout, fallback);
+                    return retreatTarget;
                 }
 
                 return _mission.FallbackExitPoint == Vector2.Zero ? fallback : _mission.FallbackExitPoint;
@@ -395,14 +470,18 @@ internal sealed class ScoutSystem
 
     private void ReleaseScoutLock()
     {
-        if (_mission.ScoutUnitId.HasValue)
-        {
-            var scout = _context.Units.Find(unit => unit.Alive && unit.Side == GameSide.AI && unit.Id == _mission.ScoutUnitId.Value);
-            if (scout is not null)
-            {
-                scout.IsNonCombatScout = false;
-            }
-        }
+        ClearMissionOwnership();
+    }
+
+    private void ClearMissionOwnership()
+    {
+        _mission.Reset();
+    }
+
+    private void ClearRecallState()
+    {
+        _recallingScoutId = null;
+        _assemblyPoint = Vector2.Zero;
     }
 
     private bool HasActiveScoutPlan()
@@ -1209,6 +1288,20 @@ internal sealed class ScoutSystem
         _mission.PeekCompleted = true;
         _mission.RequireSectorSwitch = true;
         _mission.HasCommittedReentryPlan = false;
+    }
+
+    private bool TryStartBreakContactForImmediateThreat(SimUnit scout, ICombatTarget? threat, Vector2 fallback, string reason, out Vector2 retreatTarget)
+    {
+        retreatTarget = Vector2.Zero;
+        if (threat is null || !IsImmediateScoutThreat(scout, threat))
+        {
+            return false;
+        }
+
+        TraceScoutBreak(reason, scout, threat);
+        StartScoutBreakContact();
+        retreatTarget = GetScoutBreakContactTarget(scout, fallback);
+        return true;
     }
 
     private bool ShouldBreakScoutContact(SimUnit scout, ICombatTarget? threat)
